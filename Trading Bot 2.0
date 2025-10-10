@@ -1,0 +1,1690 @@
+//+------------------------------------------------------------------+
+//|                                    CrashBoom_Advanced_v2.0.mq5   |
+//|                          Advanced AI-Powered Trading System      |
+//+------------------------------------------------------------------+
+#property copyright "Advanced Trading Bot v2.0"
+#property version   "2.00"
+#property description "Next-gen multi-strategy bot with ML, adaptive risk, and portfolio management"
+#property strict
+
+#include <Trade\Trade.mqh>
+#include <Trade\AccountInfo.mqh>
+#include <Trade\PositionInfo.mqh>
+#include <Trade\HistoryOrderInfo.mqh>
+
+//+------------------------------------------------------------------+
+//| INPUT PARAMETERS                                                  |
+//+------------------------------------------------------------------+
+input group "=== CORE SETTINGS ==="
+input bool     EnableTrading = true;
+input double   InitialLotSize = 0.01;
+input double   MaxLotSize = 1.0;
+input int      MagicNumber = 234567;
+input bool     UseAdaptivePositionSizing = true;
+input bool     UsePortfolioApproach = true;
+
+input group "=== STRATEGY SELECTION ==="
+input bool     Enable_TrendFollowing = true;
+input bool     Enable_MeanReversion = true;
+input bool     Enable_BreakoutStrategy = true;
+input bool     Enable_CrashSpikeStrategy = true;
+input bool     Enable_ScalpingStrategy = true;
+
+input group "=== MULTI-TIMEFRAME ANALYSIS ==="
+input bool     UseMultiTimeframe = true;
+input ENUM_TIMEFRAMES MTF_Higher = PERIOD_M15;
+input ENUM_TIMEFRAMES MTF_Current = PERIOD_M5;
+input ENUM_TIMEFRAMES MTF_Lower = PERIOD_M1;
+input int      MinTimeframeAlignment = 2; // How many TFs must agree
+
+input group "=== ADVANCED RISK MANAGEMENT ==="
+input double   MaxRiskPercentPerTrade = 1.0;
+input double   MaxDailyRiskPercent = 5.0;
+input double   MaxDrawdownPercent = 15.0;
+input bool     UseKellyCriterion = false;
+input double   KellyFraction = 0.25;
+input bool     UseDynamicStops = true;
+input bool     UseTrailingStop = true;
+input double   TrailingStopActivationPips = 20.0;
+input double   TrailingStopDistancePips = 15.0;
+
+input group "=== PATTERN RECOGNITION ==="
+input int      MinPatternStrength = 65;
+input bool     RequireVolumeConfirmation = false;
+input bool     RequireDivergenceConfirmation = false;
+input int      LookbackBars = 100;
+
+input group "=== CRASH 500 SPECIFIC ==="
+input bool     DetectPreSpikePattens = true;
+input bool     TradePostSpikeRecovery = true;
+input double   SpikeThresholdPercent = 3.0;
+input int      PostSpikeWaitBars = 3;
+input bool     AvoidHighVolatilityPeriods = true;
+input double   MaxVolatilityMultiplier = 3.0;
+
+input group "=== MARKET FILTERS ==="
+input bool     FilterBySpread = true;
+input double   MaxSpreadPips = 5.0;
+input bool     FilterByTimeSession = true;
+input int      TradingStartHour = 8;
+input int      TradingEndHour = 20;
+input bool     AvoidWeekendGaps = true;
+input bool     FilterByEconomicNews = false;
+
+input group "=== OPTIMIZATION & LEARNING ==="
+input bool     EnableAdaptiveLearning = true;
+input int      PerformanceReviewPeriod = 50; // trades
+input bool     DisableUnderperformingStrategies = true;
+input double   MinStrategyProfitFactor = 1.2;
+input bool     UseWalkForwardOptimization = false;
+input int      OptimizationPeriodDays = 30;
+
+input group "=== ALERTS & MONITORING ==="
+input bool     EnableTelegramAlerts = false;
+input string   TelegramBotToken = "";
+input string   TelegramChatID = "";
+input bool     EnableEmailAlerts = false;
+input bool     EnablePushNotifications = true;
+input bool     AlertOnEntryOnly = false;
+input bool     SendDailySummary = true;
+input int      SummaryHour = 21;
+
+//+------------------------------------------------------------------+
+//| ENUMERATIONS                                                      |
+//+------------------------------------------------------------------+
+enum ENUM_SIGNAL_TYPE
+{
+   SIGNAL_NONE = 0,
+   SIGNAL_BUY = 1,
+   SIGNAL_SELL = -1
+};
+
+enum ENUM_STRATEGY_TYPE
+{
+   STRATEGY_TREND = 0,
+   STRATEGY_MEAN_REVERSION = 1,
+   STRATEGY_BREAKOUT = 2,
+   STRATEGY_CRASH_SPIKE = 3,
+   STRATEGY_SCALPING = 4
+};
+
+enum ENUM_MARKET_REGIME
+{
+   REGIME_TRENDING_UP = 0,
+   REGIME_TRENDING_DOWN = 1,
+   REGIME_RANGING = 2,
+   REGIME_VOLATILE = 3,
+   REGIME_QUIET = 4
+};
+
+//+------------------------------------------------------------------+
+//| STRUCTURES                                                        |
+//+------------------------------------------------------------------+
+struct SSignal
+{
+   ENUM_SIGNAL_TYPE direction;
+   double strength;
+   string reason;
+   ENUM_STRATEGY_TYPE strategy;
+   double entryPrice;
+   double stopLoss;
+   double takeProfit;
+   datetime timestamp;
+};
+
+struct SMarketContext
+{
+   ENUM_MARKET_REGIME regime;
+   double volatility;
+   double avgVolume;
+   double trend;
+   bool isSpiking;
+   double spreadValue;
+   bool newsAhead;
+};
+
+struct SStrategyPerformance
+{
+   ENUM_STRATEGY_TYPE type;
+   int totalTrades;
+   int winningTrades;
+   int losingTrades;
+   double totalProfit;
+   double totalLoss;
+   double winRate;
+   double profitFactor;
+   double avgWin;
+   double avgLoss;
+   double sharpeRatio;
+   bool isEnabled;
+   datetime lastUpdate;
+};
+
+struct SRiskMetrics
+{
+   double dailyPnL;
+   double weeklyPnL;
+   double monthlyPnL;
+   double currentDrawdown;
+   double maxDrawdown;
+   double peakEquity;
+   int consecutiveWins;
+   int consecutiveLosses;
+   double currentRiskExposure;
+   datetime lastTradeTime;
+};
+
+struct SPositionInfo
+{
+   ulong ticket;
+   ENUM_STRATEGY_TYPE strategy;
+   double entryPrice;
+   double currentPrice;
+   double stopLoss;
+   double takeProfit;
+   double profit;
+   double volume;
+   datetime openTime;
+   bool trailingActive;
+};
+
+//+------------------------------------------------------------------+
+//| GLOBAL VARIABLES                                                  |
+//+------------------------------------------------------------------+
+CTrade trade;
+CAccountInfo account;
+CPositionInfo position;
+
+SMarketContext marketContext;
+SRiskMetrics riskMetrics;
+SStrategyPerformance strategyPerformance[5];
+
+datetime lastBarTime = 0;
+datetime lastDailySummary = 0;
+datetime lastOptimization = 0;
+
+SPositionInfo activePositions[];
+int totalActivePositions = 0;
+
+//+------------------------------------------------------------------+
+//| UTILITY FUNCTIONS                                                 |
+//+------------------------------------------------------------------+
+double GetPipValue()
+{
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   return (digits == 3 || digits == 5) ? point * 10 : point;
+}
+
+double PipsToPrice(double pips)
+{
+   return pips * GetPipValue();
+}
+
+double PriceToPips(double price)
+{
+   return price / GetPipValue();
+}
+
+bool IsNewBar()
+{
+   datetime currentBarTime = iTime(_Symbol, PERIOD_CURRENT, 0);
+   if(currentBarTime != lastBarTime)
+   {
+      lastBarTime = currentBarTime;
+      return true;
+   }
+   return false;
+}
+
+string TimeframeToString(ENUM_TIMEFRAMES tf)
+{
+   switch(tf)
+   {
+      case PERIOD_M1: return "M1";
+      case PERIOD_M5: return "M5";
+      case PERIOD_M15: return "M15";
+      case PERIOD_M30: return "M30";
+      case PERIOD_H1: return "H1";
+      case PERIOD_H4: return "H4";
+      case PERIOD_D1: return "D1";
+      default: return "UNKNOWN";
+   }
+}
+
+void SendNotification(string message, bool isUrgent = false)
+{
+   string prefix = isUrgent ? "⚠️ URGENT: " : "ℹ️ ";
+   
+   if(EnablePushNotifications)
+      SendNotification(prefix + message);
+   
+   if(EnableEmailAlalerts)
+      SendMail("Trading Bot Alert", message);
+      
+   Print(message);
+}
+
+//+------------------------------------------------------------------+
+//| MARKET CONTEXT ANALYZER                                           |
+//+------------------------------------------------------------------+
+class CMarketAnalyzer
+{
+private:
+   int atrHandle;
+   int volumeHandle;
+   int adxHandle;
+   
+public:
+   bool Init()
+   {
+      atrHandle = iATR(_Symbol, PERIOD_CURRENT, 14);
+      adxHandle = iADX(_Symbol, PERIOD_CURRENT, 14);
+      
+      if(atrHandle == INVALID_HANDLE || adxHandle == INVALID_HANDLE)
+      {
+         Print("ERROR: Failed to initialize market analyzer");
+         return false;
+   }
+   
+private:
+   bool CheckTimeframeTrend(ENUM_TIMEFRAMES tf, ENUM_SIGNAL_TYPE direction)
+   {
+      double ema20[], ema50[];
+      ArraySetAsSeries(ema20, true);
+      ArraySetAsSeries(ema50, true);
+      
+      int ema20Handle = iMA(_Symbol, tf, 20, 0, MODE_EMA, PRICE_CLOSE);
+      int ema50Handle = iMA(_Symbol, tf, 50, 0, MODE_EMA, PRICE_CLOSE);
+      
+      if(CopyBuffer(ema20Handle, 0, 0, 2, ema20) <= 0 ||
+         CopyBuffer(ema50Handle, 0, 0, 2, ema50) <= 0)
+      {
+         IndicatorRelease(ema20Handle);
+         IndicatorRelease(ema50Handle);
+         return false;
+      }
+      
+      bool bullish = (ema20[0] > ema50[0]);
+      bool bearish = (ema20[0] < ema50[0]);
+      
+      IndicatorRelease(ema20Handle);
+      IndicatorRelease(ema50Handle);
+      
+      if(direction == SIGNAL_BUY && bullish) return true;
+      if(direction == SIGNAL_SELL && bearish) return true;
+      
+      return false;
+   }
+};
+
+//+------------------------------------------------------------------+
+//| ADAPTIVE POSITION SIZER                                           |
+//+------------------------------------------------------------------+
+class CAdaptivePositionSizer
+{
+public:
+   double CalculatePositionSize(SSignal &signal, double stopLossDistance)
+   {
+      if(stopLossDistance <= 0) return 0;
+      
+      double riskAmount = account.Balance() * MaxRiskPercentPerTrade / 100.0;
+      
+      // Adjust risk based on signal strength
+      if(signal.strength >= 80)
+         riskAmount *= 1.2;
+      else if(signal.strength < 70)
+         riskAmount *= 0.8;
+      
+      // Adjust based on consecutive losses
+      if(riskMetrics.consecutiveLosses >= 2)
+         riskAmount *= 0.5;
+      else if(riskMetrics.consecutiveLosses >= 4)
+         riskAmount *= 0.25;
+      
+      // Adjust based on current drawdown
+      if(riskMetrics.currentDrawdown > 10)
+         riskAmount *= 0.5;
+      
+      // Kelly Criterion adjustment
+      if(UseKellyCriterion)
+      {
+         double kellySize = CalculateKellySize(signal.strategy);
+         if(kellySize > 0)
+            riskAmount = MathMin(riskAmount, kellySize);
+      }
+      
+      // Calculate lot size
+      double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+      double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+      
+      if(tickSize == 0) return 0;
+      
+      double lotSize = riskAmount / (stopLossDistance / tickSize * tickValue);
+      
+      // Apply limits
+      double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+      double maxLot = MathMin(MaxLotSize, SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX));
+      
+      lotSize = MathMax(minLot, MathMin(maxLot, lotSize));
+      lotSize = NormalizeDouble(lotSize, 2);
+      
+      return lotSize;
+   }
+   
+private:
+   double CalculateKellySize(ENUM_STRATEGY_TYPE strategy)
+   {
+      if(strategyPerformance[(int)strategy].totalTrades < 20)
+         return 0;
+      
+      double winRate = strategyPerformance[(int)strategy].winRate;
+      double avgWin = strategyPerformance[(int)strategy].avgWin;
+      double avgLoss = MathAbs(strategyPerformance[(int)strategy].avgLoss);
+      
+      if(avgLoss == 0) return 0;
+      
+      double winLossRatio = avgWin / avgLoss;
+      double kelly = (winRate * winLossRatio - (1 - winRate)) / winLossRatio;
+      
+      kelly = MathMax(0, MathMin(kelly, 0.25)) * KellyFraction;
+      
+      return account.Balance() * kelly;
+   }
+};
+
+//+------------------------------------------------------------------+
+//| DYNAMIC STOP LOSS & TAKE PROFIT MANAGER                          |
+//+------------------------------------------------------------------+
+class CDynamicSLTP
+{
+public:
+   void CalculateLevels(SSignal &signal, double atr)
+   {
+      double currentPrice = (signal.direction == SIGNAL_BUY) ? 
+                           SymbolInfoDouble(_Symbol, SYMBOL_ASK) : 
+                           SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      
+      double slDistance = 0, tpDistance = 0;
+      
+      if(UseDynamicStops)
+      {
+         slDistance = CalculateDynamicSL(signal, atr);
+         tpDistance = CalculateDynamicTP(signal, atr, slDistance);
+      }
+      else
+      {
+         slDistance = atr * 1.5;
+         tpDistance = atr * 2.5;
+      }
+      
+      if(signal.direction == SIGNAL_BUY)
+      {
+         signal.stopLoss = currentPrice - slDistance;
+         signal.takeProfit = currentPrice + tpDistance;
+      }
+      else
+      {
+         signal.stopLoss = currentPrice + slDistance;
+         signal.takeProfit = currentPrice - tpDistance;
+      }
+      
+      signal.entryPrice = currentPrice;
+   }
+   
+private:
+   double CalculateDynamicSL(SSignal &signal, double atr)
+   {
+      double high[], low[];
+      ArraySetAsSeries(high, true);
+      ArraySetAsSeries(low, true);
+      
+      if(CopyHigh(_Symbol, PERIOD_CURRENT, 0, 20, high) <= 0 ||
+         CopyLow(_Symbol, PERIOD_CURRENT, 0, 20, low) <= 0)
+         return atr * 1.5;
+      
+      if(signal.direction == SIGNAL_BUY)
+      {
+         int swingLow = ArrayMinimum(low, 1, 10);
+         double distance = SymbolInfoDouble(_Symbol, SYMBOL_ASK) - low[swingLow];
+         return MathMax(distance, atr * 1.2);
+      }
+      else
+      {
+         int swingHigh = ArrayMaximum(high, 1, 10);
+         double distance = high[swingHigh] - SymbolInfoDouble(_Symbol, SYMBOL_BID);
+         return MathMax(distance, atr * 1.2);
+      }
+   }
+   
+   double CalculateDynamicTP(SSignal &signal, double atr, double slDistance)
+   {
+      double riskRewardRatio = 2.0;
+      
+      if(signal.strength >= 85)
+         riskRewardRatio = 3.0;
+      else if(signal.strength >= 75)
+         riskRewardRatio = 2.5;
+      else if(signal.strength < 70)
+         riskRewardRatio = 1.5;
+      
+      if(marketContext.regime == REGIME_TRENDING_UP || marketContext.regime == REGIME_TRENDING_DOWN)
+         riskRewardRatio += 0.5;
+      
+      return slDistance * riskRewardRatio;
+   }
+};
+
+//+------------------------------------------------------------------+
+//| TRAILING STOP MANAGER                                             |
+//+------------------------------------------------------------------+
+class CTrailingStopManager
+{
+public:
+   void ManageTrailingStops()
+   {
+      if(!UseTrailingStop) return;
+      
+      for(int i = PositionsTotal() - 1; i >= 0; i--)
+      {
+         if(position.SelectByIndex(i))
+         {
+            if(position.Magic() == MagicNumber && position.Symbol() == _Symbol)
+            {
+               UpdateTrailingStop(position.Ticket());
+            }
+         }
+      }
+   }
+   
+private:
+   void UpdateTrailingStop(ulong ticket)
+   {
+      if(!position.SelectByTicket(ticket)) return;
+      
+      double currentPrice = position.PriceCurrent();
+      double openPrice = position.PriceOpen();
+      double currentSL = position.StopLoss();
+      double currentTP = position.TakeProfit();
+      
+      double profitDistance = 0;
+      double newSL = 0;
+      bool shouldUpdate = false;
+      
+      if(position.Type() == POSITION_TYPE_BUY)
+      {
+         profitDistance = currentPrice - openPrice;
+         
+         if(profitDistance >= PipsToPrice(TrailingStopActivationPips))
+         {
+            newSL = currentPrice - PipsToPrice(TrailingStopDistancePips);
+            
+            if(newSL > currentSL + PipsToPrice(1))
+               shouldUpdate = true;
+         }
+      }
+      else if(position.Type() == POSITION_TYPE_SELL)
+      {
+         profitDistance = openPrice - currentPrice;
+         
+         if(profitDistance >= PipsToPrice(TrailingStopActivationPips))
+         {
+            newSL = currentPrice + PipsToPrice(TrailingStopDistancePips);
+            
+            if(newSL < currentSL - PipsToPrice(1) || currentSL == 0)
+               shouldUpdate = true;
+         }
+      }
+      
+      if(shouldUpdate)
+      {
+         if(!trade.PositionModify(ticket, newSL, currentTP))
+         {
+            Print("Failed to update trailing stop for ticket ", ticket, 
+                  " Error: ", GetLastError());
+         }
+         else
+         {
+            Print("Trailing stop updated for ticket ", ticket, " New SL: ", newSL);
+         }
+      }
+   }
+};
+
+//+------------------------------------------------------------------+
+//| STRATEGY PERFORMANCE TRACKER                                      |
+//+------------------------------------------------------------------+
+class CPerformanceTracker
+{
+public:
+   void Init()
+   {
+      for(int i = 0; i < 5; i++)
+      {
+         strategyPerformance[i].type = (ENUM_STRATEGY_TYPE)i;
+         strategyPerformance[i].totalTrades = 0;
+         strategyPerformance[i].winningTrades = 0;
+         strategyPerformance[i].losingTrades = 0;
+         strategyPerformance[i].totalProfit = 0;
+         strategyPerformance[i].totalLoss = 0;
+         strategyPerformance[i].winRate = 0;
+         strategyPerformance[i].profitFactor = 0;
+         strategyPerformance[i].avgWin = 0;
+         strategyPerformance[i].avgLoss = 0;
+         strategyPerformance[i].isEnabled = true;
+         strategyPerformance[i].lastUpdate = TimeCurrent();
+      }
+   }
+   
+   void UpdatePerformance()
+   {
+      if(!EnableAdaptiveLearning) return;
+      
+      datetime fromTime = TimeCurrent() - PerformanceReviewPeriod * 24 * 60 * 60;
+      
+      if(!HistorySelect(fromTime, TimeCurrent()))
+         return;
+      
+      for(int i = 0; i < 5; i++)
+      {
+         AnalyzeStrategyPerformance((ENUM_STRATEGY_TYPE)i);
+         
+         if(DisableUnderperformingStrategies)
+         {
+            if(strategyPerformance[i].totalTrades >= 20 &&
+               strategyPerformance[i].profitFactor < MinStrategyProfitFactor)
+            {
+               strategyPerformance[i].isEnabled = false;
+               Print("Strategy ", i, " disabled due to poor performance. PF: ", 
+                     strategyPerformance[i].profitFactor);
+            }
+         }
+      }
+   }
+   
+private:
+   void AnalyzeStrategyPerformance(ENUM_STRATEGY_TYPE strategy)
+   {
+      int trades = 0;
+      int wins = 0;
+      int losses = 0;
+      double totalProfit = 0;
+      double totalLoss = 0;
+      
+      for(int i = 0; i < HistoryDealsTotal(); i++)
+      {
+         ulong dealTicket = HistoryDealGetTicket(i);
+         if(dealTicket == 0) continue;
+         
+         string comment = HistoryDealGetString(dealTicket, DEAL_COMMENT);
+         
+         if(StringFind(comment, "STRAT:" + IntegerToString((int)strategy)) >= 0)
+         {
+            double profit = HistoryDealGetDouble(dealTicket, DEAL_PROFIT);
+            
+            if(profit != 0)
+            {
+               trades++;
+               
+               if(profit > 0)
+               {
+                  wins++;
+                  totalProfit += profit;
+               }
+               else
+               {
+                  losses++;
+                  totalLoss += MathAbs(profit);
+               }
+            }
+         }
+      }
+      
+      strategyPerformance[(int)strategy].totalTrades = trades;
+      strategyPerformance[(int)strategy].winningTrades = wins;
+      strategyPerformance[(int)strategy].losingTrades = losses;
+      strategyPerformance[(int)strategy].totalProfit = totalProfit;
+      strategyPerformance[(int)strategy].totalLoss = totalLoss;
+      
+      if(trades > 0)
+         strategyPerformance[(int)strategy].winRate = (double)wins / trades * 100.0;
+      
+      if(totalLoss > 0)
+         strategyPerformance[(int)strategy].profitFactor = totalProfit / totalLoss;
+      
+      if(wins > 0)
+         strategyPerformance[(int)strategy].avgWin = totalProfit / wins;
+      
+      if(losses > 0)
+         strategyPerformance[(int)strategy].avgLoss = -totalLoss / losses;
+      
+      strategyPerformance[(int)strategy].lastUpdate = TimeCurrent();
+   }
+};
+
+//+------------------------------------------------------------------+
+//| RISK METRICS MONITOR                                              |
+//+------------------------------------------------------------------+
+class CRiskMonitor
+{
+public:
+   void UpdateMetrics()
+   {
+      UpdateDailyPnL();
+      UpdateDrawdown();
+      UpdateConsecutiveStats();
+      CheckRiskLimits();
+   }
+   
+   bool CheckTradingAllowed()
+   {
+      if(riskMetrics.dailyPnL < -MaxDailyRiskPercent)
+      {
+         Print("Daily loss limit reached: ", riskMetrics.dailyPnL);
+         return false;
+      }
+      
+      if(riskMetrics.currentDrawdown > MaxDrawdownPercent)
+      {
+         Print("Max drawdown exceeded: ", riskMetrics.currentDrawdown, "%");
+         return false;
+      }
+      
+      if(riskMetrics.consecutiveLosses >= MaxConsecutiveLosses)
+      {
+         Print("Too many consecutive losses: ", riskMetrics.consecutiveLosses);
+         return false;
+      }
+      
+      return true;
+   }
+   
+private:
+   void UpdateDailyPnL()
+   {
+      datetime today = StringToTime(TimeToString(TimeCurrent(), TIME_DATE));
+      
+      if(!HistorySelect(today, TimeCurrent()))
+         return;
+      
+      double pnl = 0;
+      
+      for(int i = 0; i < HistoryDealsTotal(); i++)
+      {
+         ulong ticket = HistoryDealGetTicket(i);
+         if(ticket > 0)
+         {
+            if(HistoryDealGetInteger(ticket, DEAL_MAGIC) == MagicNumber)
+               pnl += HistoryDealGetDouble(ticket, DEAL_PROFIT);
+         }
+      }
+      
+      riskMetrics.dailyPnL = (pnl / account.Balance()) * 100.0;
+   }
+   
+   void UpdateDrawdown()
+   {
+      double currentEquity = account.Equity();
+      
+      if(currentEquity > riskMetrics.peakEquity)
+      {
+         riskMetrics.peakEquity = currentEquity;
+         riskMetrics.currentDrawdown = 0;
+      }
+      else
+      {
+         if(riskMetrics.peakEquity > 0)
+            riskMetrics.currentDrawdown = 
+               (riskMetrics.peakEquity - currentEquity) / riskMetrics.peakEquity * 100.0;
+      }
+      
+      if(riskMetrics.currentDrawdown > riskMetrics.maxDrawdown)
+         riskMetrics.maxDrawdown = riskMetrics.currentDrawdown;
+   }
+   
+   void UpdateConsecutiveStats()
+   {
+      if(HistoryDealsTotal() < 2) return;
+      
+      ulong lastDeal = HistoryDealGetTicket(HistoryDealsTotal() - 1);
+      double lastProfit = HistoryDealGetDouble(lastDeal, DEAL_PROFIT);
+      
+      if(lastProfit > 0)
+      {
+         riskMetrics.consecutiveWins++;
+         riskMetrics.consecutiveLosses = 0;
+      }
+      else if(lastProfit < 0)
+      {
+         riskMetrics.consecutiveLosses++;
+         riskMetrics.consecutiveWins = 0;
+      }
+   }
+   
+   void CheckRiskLimits()
+   {
+      if(riskMetrics.currentDrawdown > MaxDrawdownPercent * 0.8)
+      {
+         SendNotification("WARNING: Approaching max drawdown - " + 
+                         DoubleToString(riskMetrics.currentDrawdown, 2) + "%", true);
+      }
+      
+      if(riskMetrics.dailyPnL < -MaxDailyRiskPercent * 0.8)
+      {
+         SendNotification("WARNING: Approaching daily loss limit - " + 
+                         DoubleToString(riskMetrics.dailyPnL, 2) + "%", true);
+      }
+   }
+};
+
+//+------------------------------------------------------------------+
+//| MAIN SIGNAL AGGREGATOR                                           |
+//+------------------------------------------------------------------+
+class CSignalAggregator
+{
+private:
+   CMarketAnalyzer marketAnalyzer;
+   CPatternEngine patternEngine;
+   CTrendStrategy trendStrategy;
+   CCrashSpikeStrategy crashStrategy;
+   CMultiTimeframeValidator mtfValidator;
+   
+public:
+   bool Init()
+   {
+      return marketAnalyzer.Init();
+   }
+   
+   SSignal GenerateSignal()
+   {
+      marketContext = marketAnalyzer.AnalyzeMarket();
+      
+      SSignal bestSignal;
+      bestSignal.direction = SIGNAL_NONE;
+      bestSignal.strength = 0;
+      
+      SSignal signals[10];
+      int signalCount = 0;
+      
+      if(Enable_TrendFollowing && strategyPerformance[STRATEGY_TREND].isEnabled)
+      {
+         signals[signalCount] = trendStrategy.Analyze(marketContext);
+         if(signals[signalCount].direction != SIGNAL_NONE)
+            signalCount++;
+      }
+      
+      if(Enable_CrashSpikeStrategy && strategyPerformance[STRATEGY_CRASH_SPIKE].isEnabled)
+      {
+         signals[signalCount] = crashStrategy.Analyze(marketContext);
+         if(signals[signalCount].direction != SIGNAL_NONE)
+            signalCount++;
+      }
+      
+      if(Enable_MeanReversion)
+      {
+         signals[signalCount] = patternEngine.DetectEngulfingPattern();
+         if(signals[signalCount].direction != SIGNAL_NONE)
+            signalCount++;
+         
+         signals[signalCount] = patternEngine.DetectPinBar();
+         if(signals[signalCount].direction != SIGNAL_NONE)
+            signalCount++;
+         
+         signals[signalCount] = patternEngine.DetectDoubleTB();
+         if(signals[signalCount].direction != SIGNAL_NONE)
+            signalCount++;
+      }
+      
+      for(int i = 0; i < signalCount; i++)
+      {
+         if(mtfValidator.ValidateSignal(signals[i]))
+         {
+            if(signals[i].strength > bestSignal.strength)
+               bestSignal = signals[i];
+         }
+      }
+      
+      bestSignal.timestamp = TimeCurrent();
+      
+      return bestSignal;
+   }
+   
+   void Cleanup()
+   {
+      marketAnalyzer.Cleanup();
+   }
+};
+
+//+------------------------------------------------------------------+
+//| TRADE EXECUTOR                                                    |
+//+------------------------------------------------------------------+
+class CTradeExecutor
+{
+private:
+   CAdaptivePositionSizer positionSizer;
+   CDynamicSLTP sltpManager;
+   
+public:
+   bool ExecuteTrade(SSignal &signal)
+   {
+      double atr = GetATR();
+      
+      sltpManager.CalculateLevels(signal, atr);
+      
+      double slDistance = MathAbs(signal.entryPrice - signal.stopLoss);
+      double lotSize = positionSizer.CalculatePositionSize(signal, slDistance);
+      
+      if(lotSize <= 0)
+      {
+         Print("Invalid lot size calculated");
+         return false;
+      }
+      
+      string comment = "STRAT:" + IntegerToString((int)signal.strategy) + 
+                      "|STR:" + IntegerToString((int)signal.strength) +
+                      "|" + signal.reason;
+      
+      ENUM_ORDER_TYPE orderType = (signal.direction == SIGNAL_BUY) ? 
+                                   ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+      
+      trade.SetExpertMagicNumber(MagicNumber);
+      
+      bool result = trade.PositionOpen(_Symbol, orderType, lotSize, 
+                                       signal.entryPrice, signal.stopLoss, 
+                                       signal.takeProfit, comment);
+      
+      if(result)
+      {
+         Print("Trade opened successfully: ", signal.reason);
+         Print("Entry: ", signal.entryPrice, " SL: ", signal.stopLoss, 
+               " TP: ", signal.takeProfit, " Lot: ", lotSize);
+         
+         if(!AlertOnEntryOnly || EnablePushNotifications)
+         {
+            string msg = "Trade Opened: " + signal.reason + 
+                        "\nDirection: " + ((signal.direction == SIGNAL_BUY) ? "BUY" : "SELL") +
+                        "\nLot Size: " + DoubleToString(lotSize, 2) +
+                        "\nEntry: " + DoubleToString(signal.entryPrice, 5);
+            SendNotification(msg);
+         }
+         
+         return true;
+      }
+      else
+      {
+         Print("Trade failed: ", trade.ResultRetcode(), " - ", 
+               trade.ResultRetcodeDescription());
+         return false;
+      }
+   }
+   
+private:
+   double GetATR()
+   {
+      double atr[];
+      ArraySetAsSeries(atr, true);
+      
+      int atrHandle = iATR(_Symbol, PERIOD_CURRENT, 14);
+      
+      if(CopyBuffer(atrHandle, 0, 0, 1, atr) > 0)
+      {
+         IndicatorRelease(atrHandle);
+         return atr[0];
+      }
+      
+      IndicatorRelease(atrHandle);
+      return 0;
+   }
+};
+
+//+------------------------------------------------------------------+
+//| GLOBAL OBJECTS                                                    |
+//+------------------------------------------------------------------+
+CSignalAggregator signalAggregator;
+CTradeExecutor tradeExecutor;
+CTrailingStopManager trailingManager;
+CPerformanceTracker performanceTracker;
+CRiskMonitor riskMonitor;
+
+//+------------------------------------------------------------------+
+//| EXPERT INITIALIZATION                                             |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   Print("========================================");
+   Print("  Advanced Crash500 Bot v2.0 Starting");
+   Print("========================================");
+   
+   trade.SetExpertMagicNumber(MagicNumber);
+   trade.SetDeviationInPoints(20);
+   trade.SetTypeFilling(ORDER_FILLING_IOC);
+   
+   if(!signalAggregator.Init())
+   {
+      Print("ERROR: Failed to initialize signal aggregator");
+      return INIT_FAILED;
+   }
+   
+   performanceTracker.Init();
+   
+   riskMetrics.dailyPnL = 0;
+   riskMetrics.weeklyPnL = 0;
+   riskMetrics.monthlyPnL = 0;
+   riskMetrics.currentDrawdown = 0;
+   riskMetrics.maxDrawdown = 0;
+   riskMetrics.peakEquity = account.Equity();
+   riskMetrics.consecutiveWins = 0;
+   riskMetrics.consecutiveLosses = 0;
+   
+   EventSetTimer(60);
+   
+   Print("Bot initialized successfully");
+   Print("Account Balance: ", account.Balance());
+   Print("Account Equity: ", account.Equity());
+   Print("========================================");
+   
+   return INIT_SUCCEEDED;
+}
+
+//+------------------------------------------------------------------+
+//| EXPERT DEINITIALIZATION                                           |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   Print("========================================");
+   Print("  Advanced Crash500 Bot v2.0 Stopping");
+   Print("========================================");
+   
+   EventKillTimer();
+   signalAggregator.Cleanup();
+   
+   Print("Bot deinitialized. Reason: ", reason);
+}
+
+//+------------------------------------------------------------------+
+//| EXPERT TICK FUNCTION                                              |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   if(!IsNewBar()) return;
+   if(!EnableTrading) return;
+   
+   riskMonitor.UpdateMetrics();
+   
+   if(!riskMonitor.CheckTradingAllowed())
+      return;
+   
+   if(FilterBySpread && marketContext.spreadValue > MaxSpreadPips)
+   {
+      Print("Spread too high: ", marketContext.spreadValue, " pips");
+      return;
+   }
+   
+   if(FilterByTimeSession)
+   {
+      MqlDateTime dt;
+      TimeToStruct(TimeCurrent(), dt);
+      
+      if(dt.hour < TradingStartHour || dt.hour >= TradingEndHour)
+         return;
+   }
+   
+   if(AvoidWeekendGaps)
+   {
+      MqlDateTime dt;
+      TimeToStruct(TimeCurrent(), dt);
+      
+      if(dt.day_of_week == 0 || dt.day_of_week == 6)
+         return;
+   }
+   
+   int openPositions = 0;
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      if(position.SelectByIndex(i))
+      {
+         if(position.Magic() == MagicNumber && position.Symbol() == _Symbol)
+            openPositions++;
+      }
+   }
+   
+   if(openPositions > 0)
+   {
+      trailingManager.ManageTrailingStops();
+      return;
+   }
+   
+   SSignal signal = signalAggregator.GenerateSignal();
+   
+   if(signal.direction != SIGNAL_NONE && signal.strength >= MinPatternStrength)
+   {
+      Print("Signal detected: ", signal.reason, 
+            " | Strength: ", signal.strength, 
+            " | Direction: ", (signal.direction == SIGNAL_BUY ? "BUY" : "SELL"));
+      
+      tradeExecutor.ExecuteTrade(signal);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| TIMER FUNCTION                                                    |
+//+------------------------------------------------------------------+
+void OnTimer()
+{
+   riskMonitor.UpdateMetrics();
+   trailingManager.ManageTrailingStops();
+   
+   static datetime lastPerformanceUpdate = 0;
+   if(TimeCurrent() - lastPerformanceUpdate > 3600)
+   {
+      performanceTracker.UpdatePerformance();
+      lastPerformanceUpdate = TimeCurrent();
+   }
+   
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   
+   if(SendDailySummary && dt.hour == SummaryHour && dt.min == 0)
+   {
+      if(TimeCurrent() - lastDailySummary > 3600)
+      {
+         SendDailySummaryReport();
+         lastDailySummary = TimeCurrent();
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| SEND DAILY SUMMARY                                                |
+//+------------------------------------------------------------------+
+void SendDailySummaryReport()
+{
+   datetime today = StringToTime(TimeToString(TimeCurrent(), TIME_DATE));
+   
+   if(!HistorySelect(today, TimeCurrent()))
+      return;
+   
+   int trades = 0;
+   int wins = 0;
+   double profit = 0;
+   
+   for(int i = 0; i < HistoryDealsTotal(); i++)
+   {
+      ulong ticket = HistoryDealGetTicket(i);
+      if(ticket > 0 && HistoryDealGetInteger(ticket, DEAL_MAGIC) == MagicNumber)
+      {
+         double dealProfit = HistoryDealGetDouble(ticket, DEAL_PROFIT);
+         if(dealProfit != 0)
+         {
+            trades++;
+            profit += dealProfit;
+            if(dealProfit > 0) wins++;
+         }
+      }
+   }
+   
+   string msg = "=== DAILY SUMMARY ===\n";
+   msg += "Total Trades: " + IntegerToString(trades) + "\n";
+   msg += "Wins: " + IntegerToString(wins) + "\n";
+   msg += "Win Rate: " + DoubleToString((trades > 0 ? (double)wins/trades*100 : 0), 1) + "%\n";
+   msg += "Profit: " + DoubleToString(profit, 2) + "\n";
+   msg += "Drawdown: " + DoubleToString(riskMetrics.currentDrawdown, 2) + "%\n";
+   msg += "Balance: " + DoubleToString(account.Balance(), 2);
+   
+   SendNotification(msg);
+   Print(msg);
+}
+
+//+------------------------------------------------------------------+
+      }
+      
+      return true;
+   }
+   
+   SMarketContext AnalyzeMarket()
+   {
+      SMarketContext context;
+      
+      // Volatility analysis
+      context.volatility = GetCurrentVolatility();
+      
+      // Trend detection
+      context.trend = DetectTrend();
+      
+      // Regime classification
+      context.regime = ClassifyRegime(context.volatility, context.trend);
+      
+      // Spike detection
+      context.isSpiking = DetectSpike();
+      
+      // Spread check
+      context.spreadValue = GetCurrentSpread();
+      
+      // News check
+      context.newsAhead = false; // Implement news calendar integration
+      
+      return context;
+   }
+   
+   double GetCurrentVolatility()
+   {
+      double atrBuffer[];
+      ArraySetAsSeries(atrBuffer, true);
+      
+      if(CopyBuffer(atrHandle, 0, 0, 20, atrBuffer) <= 0)
+         return 0;
+      
+      double currentATR = atrBuffer[0];
+      double avgATR = 0;
+      
+      for(int i = 0; i < 20; i++)
+         avgATR += atrBuffer[i];
+      
+      avgATR /= 20;
+      
+      return (avgATR > 0) ? (currentATR / avgATR) : 1.0;
+   }
+   
+   double DetectTrend()
+   {
+      double ema50[], ema200[];
+      ArraySetAsSeries(ema50, true);
+      ArraySetAsSeries(ema200, true);
+      
+      int ema50Handle = iMA(_Symbol, PERIOD_CURRENT, 50, 0, MODE_EMA, PRICE_CLOSE);
+      int ema200Handle = iMA(_Symbol, PERIOD_CURRENT, 200, 0, MODE_EMA, PRICE_CLOSE);
+      
+      if(CopyBuffer(ema50Handle, 0, 0, 3, ema50) <= 0 || 
+         CopyBuffer(ema200Handle, 0, 0, 3, ema200) <= 0)
+         return 0;
+      
+      double trendStrength = 0;
+      
+      if(ema50[0] > ema200[0])
+         trendStrength = (ema50[0] - ema200[0]) / ema200[0] * 100;
+      else
+         trendStrength = (ema50[0] - ema200[0]) / ema200[0] * 100;
+      
+      IndicatorRelease(ema50Handle);
+      IndicatorRelease(ema200Handle);
+      
+      return trendStrength;
+   }
+   
+   ENUM_MARKET_REGIME ClassifyRegime(double volatility, double trend)
+   {
+      double adxBuffer[];
+      ArraySetAsSeries(adxBuffer, true);
+      
+      if(CopyBuffer(adxHandle, 0, 0, 1, adxBuffer) <= 0)
+         return REGIME_RANGING;
+      
+      double adxValue = adxBuffer[0];
+      
+      if(volatility > MaxVolatilityMultiplier)
+         return REGIME_VOLATILE;
+      
+      if(volatility < 0.5)
+         return REGIME_QUIET;
+      
+      if(adxValue > 25 && MathAbs(trend) > 0.5)
+         return (trend > 0) ? REGIME_TRENDING_UP : REGIME_TRENDING_DOWN;
+      
+      return REGIME_RANGING;
+   }
+   
+   bool DetectSpike()
+   {
+      double high[], low[], close[];
+      ArraySetAsSeries(high, true);
+      ArraySetAsSeries(low, true);
+      ArraySetAsSeries(close, true);
+      
+      if(CopyHigh(_Symbol, PERIOD_CURRENT, 0, 5, high) <= 0 ||
+         CopyLow(_Symbol, PERIOD_CURRENT, 0, 5, low) <= 0 ||
+         CopyClose(_Symbol, PERIOD_CURRENT, 0, 5, close) <= 0)
+         return false;
+      
+      double currentRange = high[0] - low[0];
+      double avgRange = 0;
+      
+      for(int i = 1; i < 5; i++)
+         avgRange += (high[i] - low[i]);
+      
+      avgRange /= 4;
+      
+      if(avgRange > 0 && currentRange / avgRange > (1 + SpikeThresholdPercent / 100.0))
+         return true;
+      
+      return false;
+   }
+   
+   double GetCurrentSpread()
+   {
+      double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      return PriceToPips(ask - bid);
+   }
+   
+   void Cleanup()
+   {
+      if(atrHandle != INVALID_HANDLE) IndicatorRelease(atrHandle);
+      if(adxHandle != INVALID_HANDLE) IndicatorRelease(adxHandle);
+   }
+};
+
+//+------------------------------------------------------------------+
+//| PATTERN RECOGNITION ENGINE                                        |
+//+------------------------------------------------------------------+
+class CPatternEngine
+{
+private:
+   
+   bool CheckVolumeConfirmation()
+   {
+      if(!RequireVolumeConfirmation) return true;
+      
+      long volume[];
+      ArraySetAsSeries(volume, true);
+      
+      if(CopyTickVolume(_Symbol, PERIOD_CURRENT, 0, 10, volume) <= 0)
+         return false;
+      
+      long avgVolume = 0;
+      for(int i = 1; i < 10; i++)
+         avgVolume += volume[i];
+      
+      avgVolume /= 9;
+      
+      return (volume[0] > avgVolume * 1.2);
+   }
+   
+   bool CheckDivergence()
+   {
+      if(!RequireDivergenceConfirmation) return false;
+      
+      // Simplified divergence check
+      double close[], rsi[];
+      ArraySetAsSeries(close, true);
+      ArraySetAsSeries(rsi, true);
+      
+      int rsiHandle = iRSI(_Symbol, PERIOD_CURRENT, 14, PRICE_CLOSE);
+      
+      if(CopyClose(_Symbol, PERIOD_CURRENT, 0, 20, close) <= 0 ||
+         CopyBuffer(rsiHandle, 0, 0, 20, rsi) <= 0)
+      {
+         IndicatorRelease(rsiHandle);
+         return false;
+      }
+      
+      bool bullishDiv = (close[0] < close[10] && rsi[0] > rsi[10]);
+      bool bearishDiv = (close[0] > close[10] && rsi[0] < rsi[10]);
+      
+      IndicatorRelease(rsiHandle);
+      
+      return (bullishDiv || bearishDiv);
+   }
+
+public:
+   
+   SSignal DetectEngulfingPattern()
+   {
+      SSignal signal;
+      signal.direction = SIGNAL_NONE;
+      signal.strength = 0;
+      
+      double open[], close[], high[], low[];
+      ArraySetAsSeries(open, true);
+      ArraySetAsSeries(close, true);
+      ArraySetAsSeries(high, true);
+      ArraySetAsSeries(low, true);
+      
+      if(CopyOpen(_Symbol, PERIOD_CURRENT, 0, 3, open) <= 0 ||
+         CopyClose(_Symbol, PERIOD_CURRENT, 0, 3, close) <= 0 ||
+         CopyHigh(_Symbol, PERIOD_CURRENT, 0, 3, high) <= 0 ||
+         CopyLow(_Symbol, PERIOD_CURRENT, 0, 3, low) <= 0)
+         return signal;
+      
+      bool bullishEngulfing = (close[2] < open[2]) && 
+                              (close[1] > open[1]) &&
+                              (open[1] <= close[2]) &&
+                              (close[1] >= open[2]);
+      
+      bool bearishEngulfing = (close[2] > open[2]) &&
+                              (close[1] < open[1]) &&
+                              (open[1] >= close[2]) &&
+                              (close[1] <= open[2]);
+      
+      if(bullishEngulfing)
+      {
+         signal.direction = SIGNAL_BUY;
+         signal.strength = 75;
+         signal.reason = "Bullish Engulfing";
+         signal.strategy = STRATEGY_MEAN_REVERSION;
+      }
+      else if(bearishEngulfing)
+      {
+         signal.direction = SIGNAL_SELL;
+         signal.strength = 75;
+         signal.reason = "Bearish Engulfing";
+         signal.strategy = STRATEGY_MEAN_REVERSION;
+      }
+      
+      if(signal.direction != SIGNAL_NONE && CheckVolumeConfirmation())
+         signal.strength += 10;
+      
+      return signal;
+   }
+   
+   SSignal DetectPinBar()
+   {
+      SSignal signal;
+      signal.direction = SIGNAL_NONE;
+      signal.strength = 0;
+      
+      double open[], close[], high[], low[];
+      ArraySetAsSeries(open, true);
+      ArraySetAsSeries(close, true);
+      ArraySetAsSeries(high, true);
+      ArraySetAsSeries(low, true);
+      
+      if(CopyOpen(_Symbol, PERIOD_CURRENT, 0, 2, open) <= 0 ||
+         CopyClose(_Symbol, PERIOD_CURRENT, 0, 2, close) <= 0 ||
+         CopyHigh(_Symbol, PERIOD_CURRENT, 0, 2, high) <= 0 ||
+         CopyLow(_Symbol, PERIOD_CURRENT, 0, 2, low) <= 0)
+         return signal;
+      
+      double body = MathAbs(close[1] - open[1]);
+      double upperWick = high[1] - MathMax(close[1], open[1]);
+      double lowerWick = MathMin(close[1], open[1]) - low[1];
+      double totalRange = high[1] - low[1];
+      
+      if(totalRange == 0) return signal;
+      
+      bool bullishPin = (lowerWick > body * 2) && (lowerWick > totalRange * 0.6);
+      bool bearishPin = (upperWick > body * 2) && (upperWick > totalRange * 0.6);
+      
+      if(bullishPin)
+      {
+         signal.direction = SIGNAL_BUY;
+         signal.strength = 70;
+         signal.reason = "Bullish Pin Bar";
+         signal.strategy = STRATEGY_MEAN_REVERSION;
+      }
+      else if(bearishPin)
+      {
+         signal.direction = SIGNAL_SELL;
+         signal.strength = 70;
+         signal.reason = "Bearish Pin Bar";
+         signal.strategy = STRATEGY_MEAN_REVERSION;
+      }
+      
+      return signal;
+   }
+   
+   SSignal DetectDoubleTB()
+   {
+      SSignal signal;
+      signal.direction = SIGNAL_NONE;
+      signal.strength = 0;
+      
+      double high[], low[];
+      ArraySetAsSeries(high, true);
+      ArraySetAsSeries(low, true);
+      
+      if(CopyHigh(_Symbol, PERIOD_CURRENT, 0, 30, high) <= 0 ||
+         CopyLow(_Symbol, PERIOD_CURRENT, 0, 30, low) <= 0)
+         return signal;
+      
+      int highestBar1 = ArrayMaximum(high, 5, 10);
+      int highestBar2 = ArrayMaximum(high, 15, 10);
+      
+      if(MathAbs(high[highestBar1] - high[highestBar2]) < PipsToPrice(5))
+      {
+         signal.direction = SIGNAL_SELL;
+         signal.strength = 80;
+         signal.reason = "Double Top";
+         signal.strategy = STRATEGY_MEAN_REVERSION;
+      }
+      
+      int lowestBar1 = ArrayMinimum(low, 5, 10);
+      int lowestBar2 = ArrayMinimum(low, 15, 10);
+      
+      if(MathAbs(low[lowestBar1] - low[lowestBar2]) < PipsToPrice(5))
+      {
+         signal.direction = SIGNAL_BUY;
+         signal.strength = 80;
+         signal.reason = "Double Bottom";
+         signal.strategy = STRATEGY_MEAN_REVERSION;
+      }
+      
+      return signal;
+   }
+};
+
+//+------------------------------------------------------------------+
+//| STRATEGY: TREND FOLLOWING                                         |
+//+------------------------------------------------------------------+
+class CTrendStrategy
+{
+public:
+   SSignal Analyze(SMarketContext &context)
+   {
+      SSignal signal;
+      signal.direction = SIGNAL_NONE;
+      signal.strength = 0;
+      signal.strategy = STRATEGY_TREND;
+      
+      if(context.regime != REGIME_TRENDING_UP && context.regime != REGIME_TRENDING_DOWN)
+         return signal;
+      
+      double ema8[], ema21[], ema50[];
+      ArraySetAsSeries(ema8, true);
+      ArraySetAsSeries(ema21, true);
+      ArraySetAsSeries(ema50, true);
+      
+      int ema8Handle = iMA(_Symbol, PERIOD_CURRENT, 8, 0, MODE_EMA, PRICE_CLOSE);
+      int ema21Handle = iMA(_Symbol, PERIOD_CURRENT, 21, 0, MODE_EMA, PRICE_CLOSE);
+      int ema50Handle = iMA(_Symbol, PERIOD_CURRENT, 50, 0, MODE_EMA, PRICE_CLOSE);
+      
+      if(CopyBuffer(ema8Handle, 0, 0, 3, ema8) <= 0 ||
+         CopyBuffer(ema21Handle, 0, 0, 3, ema21) <= 0 ||
+         CopyBuffer(ema50Handle, 0, 0, 3, ema50) <= 0)
+      {
+         IndicatorRelease(ema8Handle);
+         IndicatorRelease(ema21Handle);
+         IndicatorRelease(ema50Handle);
+         return signal;
+      }
+      
+      bool bullishAlignment = (ema8[0] > ema21[0] && ema21[0] > ema50[0]);
+      bool bearishAlignment = (ema8[0] < ema21[0] && ema21[0] < ema50[0]);
+      
+      bool bullishCross = (ema8[1] <= ema21[1] && ema8[0] > ema21[0]);
+      bool bearishCross = (ema8[1] >= ema21[1] && ema8[0] < ema21[0]);
+      
+      if(bullishAlignment && bullishCross)
+      {
+         signal.direction = SIGNAL_BUY;
+         signal.strength = 75;
+         signal.reason = "EMA Bullish Cross + Alignment";
+      }
+      else if(bearishAlignment && bearishCross)
+      {
+         signal.direction = SIGNAL_SELL;
+         signal.strength = 75;
+         signal.reason = "EMA Bearish Cross + Alignment";
+      }
+      
+      IndicatorRelease(ema8Handle);
+      IndicatorRelease(ema21Handle);
+      IndicatorRelease(ema50Handle);
+      
+      return signal;
+   }
+};
+
+//+------------------------------------------------------------------+
+//| STRATEGY: CRASH SPIKE SPECIALIST                                 |
+//+------------------------------------------------------------------+
+class CCrashSpikeStrategy
+{
+public:
+   SSignal Analyze(SMarketContext &context)
+   {
+      SSignal signal;
+      signal.direction = SIGNAL_NONE;
+      signal.strength = 0;
+      signal.strategy = STRATEGY_CRASH_SPIKE;
+      
+      if(!DetectPreSpikePattens && !TradePostSpikeRecovery)
+         return signal;
+      
+      if(context.isSpiking)
+      {
+         signal = DetectPostSpikeRecovery();
+      }
+      else
+      {
+         signal = DetectPreSpikeSetup();
+      }
+      
+      return signal;
+   }
+   
+private:
+   SSignal DetectPreSpikeSetup()
+   {
+      SSignal signal;
+      signal.direction = SIGNAL_NONE;
+      signal.strength = 0;
+      
+      double atr[], bb_upper[], bb_lower[], bb_middle[];
+      ArraySetAsSeries(atr, true);
+      ArraySetAsSeries(bb_upper, true);
+      ArraySetAsSeries(bb_lower, true);
+      ArraySetAsSeries(bb_middle, true);
+      
+      int atrHandle = iATR(_Symbol, PERIOD_CURRENT, 14);
+      int bbHandle = iBands(_Symbol, PERIOD_CURRENT, 20, 0, 2.0, PRICE_CLOSE);
+      
+      if(CopyBuffer(atrHandle, 0, 0, 20, atr) <= 0 ||
+         CopyBuffer(bbHandle, 1, 0, 5, bb_upper) <= 0 ||
+         CopyBuffer(bbHandle, 2, 0, 5, bb_lower) <= 0 ||
+         CopyBuffer(bbHandle, 0, 0, 5, bb_middle) <= 0)
+      {
+         IndicatorRelease(atrHandle);
+         IndicatorRelease(bbHandle);
+         return signal;
+      }
+      
+      double avgATR = 0;
+      for(int i = 0; i < 20; i++)
+         avgATR += atr[i];
+      avgATR /= 20;
+      
+      double bbWidth = bb_upper[0] - bb_lower[0];
+      double avgWidth = 0;
+      for(int i = 1; i < 5; i++)
+         avgWidth += (bb_upper[i] - bb_lower[i]);
+      avgWidth /= 4;
+      
+      bool squeeze = (bbWidth < avgWidth * 0.7) && (atr[0] < avgATR * 0.6);
+      
+      if(squeeze)
+      {
+         double close = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+         
+         if(close < bb_middle[0])
+         {
+            signal.direction = SIGNAL_BUY;
+            signal.strength = 85;
+            signal.reason = "Pre-Spike Squeeze - Bullish";
+         }
+         else
+         {
+            signal.direction = SIGNAL_SELL;
+            signal.strength = 65;
+            signal.reason = "Pre-Spike Squeeze - Bearish";
+         }
+      }
+      
+      IndicatorRelease(atrHandle);
+      IndicatorRelease(bbHandle);
+      
+      return signal;
+   }
+   
+   SSignal DetectPostSpikeRecovery()
+   {
+      SSignal signal;
+      signal.direction = SIGNAL_NONE;
+      signal.strength = 0;
+      
+      double high[], low[], close[];
+      ArraySetAsSeries(high, true);
+      ArraySetAsSeries(low, true);
+      ArraySetAsSeries(close, true);
+      
+      if(CopyHigh(_Symbol, PERIOD_CURRENT, 0, 10, high) <= 0 ||
+         CopyLow(_Symbol, PERIOD_CURRENT, 0, 10, low) <= 0 ||
+         CopyClose(_Symbol, PERIOD_CURRENT, 0, 10, close) <= 0)
+         return signal;
+      
+      int spikeBar = -1;
+      double maxSpike = 0;
+      
+      for(int i = 1; i < 10; i++)
+      {
+         double range = high[i] - low[i];
+         if(range > maxSpike)
+         {
+            maxSpike = range;
+            spikeBar = i;
+         }
+      }
+      
+      if(spikeBar > 0 && spikeBar <= PostSpikeWaitBars)
+      {
+         double recoveryLevel = (high[spikeBar] + low[spikeBar]) / 2;
+         
+         if(close[0] < recoveryLevel && close[0] > low[spikeBar])
+         {
+            signal.direction = SIGNAL_BUY;
+            signal.strength = 80;
+            signal.reason = "Post-Spike Recovery Buy";
+         }
+      }
+      
+      return signal;
+   }
+};
+
+//+------------------------------------------------------------------+
+//| MULTI-TIMEFRAME VALIDATOR                                         |
+//+------------------------------------------------------------------+
+class CMultiTimeframeValidator
+{
+public:
+   bool ValidateSignal(SSignal &signal)
+   {
+      if(!UseMultiTimeframe) return true;
+      
+      int alignmentCount = 0;
+      
+      if(CheckTimeframeTrend(MTF_Higher, signal.direction))
+         alignmentCount++;
+      
+      if(CheckTimeframeTrend(MTF_Current, signal.direction))
+         alignmentCount++;
+      
+      if(CheckTimeframeTrend(MTF_Lower, signal.direction))
+         alignmentCount++;
+      
+      if(alignmentCount >= MinTimeframeAlignment)
+      {
+         signal.strength += (alignmentCount * 5);
+         return true;
+      }
+      
+      return false;
