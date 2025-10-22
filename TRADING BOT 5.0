@@ -1,0 +1,456 @@
+//+------------------------------------------------------------------+
+//|                                    CrashBoom_Robot_v5.0_Fixed.mq5|
+//|          Advanced Multi-Pattern EA with Entry Filters & Crash   |
+//+------------------------------------------------------------------+
+#property copyright "CrashBoom"
+#property version   "5.01"
+#property strict
+
+#include <Trade\Trade.mqh>
+CTrade trade;
+
+#define MAX_ORDER_RETRIES 3
+#define ORDER_RETRY_DELAY_MS 500
+
+//==================== INPUTS =========================================
+input string  InpSymbol                = "";     // Empty -> current chart symbol
+input double  InpLots                  = 0.10;   // default lot size (can be dynamic)
+input double  StopLossMultiplier       = 1.0;    // multiplier applied to base SL distance
+input double  MaxMultiplier            = 3.0;    // cap on multiplier
+input int     ConfidenceThreshold      = 75;     // minimum confidence percent
+input int     BaseStopLossPoints       = 200;    // base SL in points (fallback)
+input double  MaxDailyDrawdownPercent  = 10.0;   // drawdown protection (% of balance)
+input int     RecoveryMaxAttempts      = 3;      // recovery attempts after crash detection
+input int     TrailingStopPoints       = 100;    // trailing stop distance (points)
+input int     TrailingStepPoints       = 10;     // trailing step (points)
+input int     MagicNumber              = 50000;  // magic number for EA trades
+input bool    UseDynamicLotSizing      = true;   // calculate lots based on risk
+input double  RiskPercentPerTrade      = 1.0;    // percent risk per trade if dynamic
+input int     CrashDetectionPoints     = 2000;   // points for crash detection threshold
+input int     OrderCooldownSeconds     = 60;     // minimum seconds between order attempts
+input int     RecoveryPauseMinutes     = 30;     // pause duration after max recovery attempts
+
+//==================== GLOBALS ========================================
+string EA_Symbol;
+int RecoveryAttempts = 0;
+datetime LastOrderTime = 0;
+datetime TradingPausedUntil = 0;
+bool TradingPaused = false;
+
+//==================== UTIL FUNCTIONS =================================
+
+// Get the working symbol (chart if not provided)
+string GetSymbol()
+{
+   if(StringLen(InpSymbol) > 0) return InpSymbol;
+   return Symbol();
+}
+
+// Compute the effective multiplier (bounded by MaxMultiplier)
+double EffectiveMultiplier()
+{
+   double eff = StopLossMultiplier;
+   if(eff <= 0.0) eff = 1.0;
+   if(eff > MaxMultiplier) eff = MaxMultiplier;
+   return eff;
+}
+
+// Compute final stop loss price (respecting broker minimum stop distance)
+double ComputeFinalStopLossPrice(const string symbol, const double entryPrice, const bool isBuy, const double baseSL_points)
+{
+   long minStopsLevel = SymbolInfoInteger(symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   if(minStopsLevel <= 0) minStopsLevel = 10;
+
+   double effMult = EffectiveMultiplier();
+   double candidate_points = baseSL_points * effMult;
+   double final_points = MathMax(candidate_points, (double)minStopsLevel);
+
+   double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
+   if(point <= 0.0)
+   {
+      Print("ERROR: Invalid point value for symbol ", symbol);
+      return 0.0;
+   }
+
+   double distancePrice = final_points * point;
+   double slPrice = isBuy ? (entryPrice - distancePrice) : (entryPrice + distancePrice);
+
+   int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+   slPrice = NormalizeDouble(slPrice, digits);
+   return slPrice;
+}
+
+// Convert points to price distance
+double PointsToPrice(const string symbol, double points)
+{
+   double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
+   if(point <= 0.0) return 0.0;
+   return points * point;
+}
+
+// Improved dynamic lot sizing with better validation
+double CalcDynamicLots(const string symbol, double riskPercent, double sl_points)
+{
+   if(!UseDynamicLotSizing || riskPercent <= 0.0 || sl_points <= 0.0)
+      return InpLots;
+
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   if(balance <= 0.0) return InpLots;
+   
+   double riskAmount = balance * (riskPercent / 100.0);
+
+   double tick_value = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tick_size  = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_SIZE);
+   
+   if(tick_size <= 0.0 || tick_value <= 0.0)
+   {
+      PrintFormat("WARNING: Invalid tick values for %s. Using fixed lot size.", symbol);
+      return InpLots;
+   }
+
+   double value_per_point = tick_value / tick_size;
+   double lot = riskAmount / (sl_points * value_per_point);
+
+   // Normalize by lot step
+   double lotStep = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
+   double minLot  = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
+   double maxLot  = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX);
+
+   if(lotStep <= 0.0) lotStep = 0.01;
+   if(minLot <= 0.0) minLot = 0.01;
+
+   lot = MathFloor(lot / lotStep) * lotStep;
+   lot = MathMax(lot, minLot);
+   if(maxLot > 0 && lot > maxLot) lot = maxLot;
+
+   return lot;
+}
+
+// Robust order sending with retries
+bool SendMarketOrder(const string symbol, bool isBuy, double volume, double slPrice, double tpPrice, ulong &outTicket)
+{
+   outTicket = 0;
+   
+   for(int attempt = 0; attempt < MAX_ORDER_RETRIES; attempt++)
+   {
+      trade.SetExpertMagicNumber(MagicNumber);
+      trade.SetDeviationInPoints(50);
+      trade.SetTypeFilling(ORDER_FILLING_FOK);
+      trade.SetComment("CrashBoom_v5.0");
+      
+      bool ok = false;
+      if(isBuy)
+         ok = trade.Buy(volume, symbol, 0.0, slPrice, tpPrice);
+      else
+         ok = trade.Sell(volume, symbol, 0.0, slPrice, tpPrice);
+
+      if(ok)
+      {
+         outTicket = trade.ResultOrder();
+         PrintFormat("Order success: attempt=%d ticket=%I64u", attempt + 1, outTicket);
+         return true;
+      }
+      else
+      {
+         int code = trade.ResultRetcode();
+         string msg = trade.ResultRetcodeDescription();
+         PrintFormat("Order failed: attempt=%d code=%d msg=%s", attempt + 1, code, msg);
+
+         // Don't retry on terminal errors
+         if(code == TRADE_RETCODE_INVALID || code == TRADE_RETCODE_INVALID_VOLUME)
+            break;
+
+         Sleep(ORDER_RETRY_DELAY_MS);
+      }
+   }
+   return false;
+}
+
+// Check if account drawdown exceeded threshold
+bool IsDrawdownTooHigh()
+{
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double equity  = AccountInfoDouble(ACCOUNT_EQUITY);
+   
+   if(balance <= 0) return false;
+   
+   double ddPercent = ((balance - equity) / balance) * 100.0;
+   
+   if(ddPercent >= MaxDailyDrawdownPercent)
+   {
+      PrintFormat("WARNING: Drawdown %.2f%% exceeds limit %.2f%%", ddPercent, MaxDailyDrawdownPercent);
+      return true;
+   }
+   return false;
+}
+
+// Fixed trailing stop manager
+void ManageTrailingStops(const string symbol)
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(!PositionSelectByTicket(ticket)) continue;
+
+      string posSym = PositionGetString(POSITION_SYMBOL);
+      long posMagic = PositionGetInteger(POSITION_MAGIC);
+      
+      if(posSym != symbol || posMagic != MagicNumber) continue;
+
+      ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+      double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+      double currentSl = PositionGetDouble(POSITION_SL);
+      int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+
+      double currentPrice = (type == POSITION_TYPE_BUY) ? 
+                            SymbolInfoDouble(symbol, SYMBOL_BID) : 
+                            SymbolInfoDouble(symbol, SYMBOL_ASK);
+
+      double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
+      if(point <= 0.0) continue;
+
+      double profit_points = (type == POSITION_TYPE_BUY) ? 
+                            (currentPrice - openPrice) / point : 
+                            (openPrice - currentPrice) / point;
+
+      if(profit_points >= TrailingStopPoints)
+      {
+         double newSl = 0.0;
+         if(type == POSITION_TYPE_BUY)
+            newSl = currentPrice - PointsToPrice(symbol, TrailingStopPoints);
+         else
+            newSl = currentPrice + PointsToPrice(symbol, TrailingStopPoints);
+
+         newSl = NormalizeDouble(newSl, digits);
+
+         bool shouldModify = false;
+         if(type == POSITION_TYPE_BUY && (currentSl == 0.0 || newSl > currentSl))
+            shouldModify = true;
+         else if(type == POSITION_TYPE_SELL && (currentSl == 0.0 || newSl < currentSl))
+            shouldModify = true;
+
+         if(shouldModify)
+         {
+            if(trade.PositionModify(ticket, newSl, PositionGetDouble(POSITION_TP)))
+            {
+               PrintFormat("Trailing stop modified: ticket=%I64u newSL=%.5f", ticket, newSl);
+            }
+            else
+            {
+               PrintFormat("Failed to modify trailing stop: ticket=%I64u error=%d", 
+                          ticket, trade.ResultRetcode());
+            }
+         }
+      }
+   }
+}
+
+// Improved crash detection with dynamic threshold
+bool DetectCrash(const string symbol)
+{
+   MqlRates rates[];
+   ArraySetAsSeries(rates, true);
+   
+   if(CopyRates(symbol, PERIOD_M1, 0, 3, rates) != 3) 
+      return false;
+
+   double prevClose = rates[1].close;
+   double lastClose = rates[0].close;
+   
+   double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
+   if(point <= 0.0) return false;
+   
+   double diff_points = MathAbs(lastClose - prevClose) / point;
+
+   if(diff_points > CrashDetectionPoints)
+   {
+      PrintFormat("CRASH DETECTED: price jump %.0f points (threshold: %d)", 
+                  diff_points, CrashDetectionPoints);
+      return true;
+   }
+
+   double spread_points = (SymbolInfoDouble(symbol, SYMBOL_ASK) - 
+                           SymbolInfoDouble(symbol, SYMBOL_BID)) / point;
+                           
+   if(spread_points > 500)
+   {
+      PrintFormat("CRASH-LIKE: extreme spread %.0f points", spread_points);
+      return true;
+   }
+
+   return false;
+}
+
+// Signal generator stub - replace with your actual logic
+bool GenerateSignal(const string symbol, bool &isBuy, int &confidence, double &baseSL_points, double &takeProfitPrice)
+{
+   isBuy = false;
+   confidence = 0;
+   baseSL_points = BaseStopLossPoints;
+   takeProfitPrice = 0.0;
+
+   // TODO: Implement your v4.0 signal logic here
+   // This is a placeholder that returns no signal
+   
+   return false;
+}
+
+// Place order pipeline with proper checks
+bool PlaceOrderPipeline(const string symbol)
+{
+   // Check cooldown period
+   if(TimeCurrent() - LastOrderTime < OrderCooldownSeconds)
+      return false;
+
+   bool isBuy = false;
+   int confidence = 0;
+   double baseSL_points = BaseStopLossPoints;
+   double tpPrice = 0.0;
+
+   if(!GenerateSignal(symbol, isBuy, confidence, baseSL_points, tpPrice))
+      return false;
+
+   PrintFormat("Signal generated: direction=%s confidence=%d baseSL=%.0f", 
+               isBuy ? "BUY" : "SELL", confidence, baseSL_points);
+
+   if(confidence < ConfidenceThreshold)
+   {
+      PrintFormat("Signal confidence %d below threshold %d. Skipping.", 
+                  confidence, ConfidenceThreshold);
+      return false;
+   }
+
+   double entryPrice = isBuy ? SymbolInfoDouble(symbol, SYMBOL_ASK) : 
+                               SymbolInfoDouble(symbol, SYMBOL_BID);
+
+   double slPrice = ComputeFinalStopLossPrice(symbol, entryPrice, isBuy, baseSL_points);
+   if(slPrice == 0.0)
+   {
+      Print("ERROR: Failed to compute valid stop loss price");
+      return false;
+   }
+
+   // Compute TP if not provided
+   if(tpPrice == 0.0)
+   {
+      double sl_distance = MathAbs(entryPrice - slPrice);
+      tpPrice = isBuy ? (entryPrice + sl_distance * 2.0) : (entryPrice - sl_distance * 2.0);
+      tpPrice = NormalizeDouble(tpPrice, (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS));
+   }
+
+   double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
+   if(point <= 0.0) return false;
+   
+   double sl_points = MathAbs(entryPrice - slPrice) / point;
+   double lots = UseDynamicLotSizing ? 
+                 CalcDynamicLots(symbol, RiskPercentPerTrade, sl_points) : InpLots;
+
+   if(IsDrawdownTooHigh())
+   {
+      Print("Drawdown protection: No new trades allowed");
+      return false;
+   }
+
+   ulong ticket = 0;
+   bool ok = SendMarketOrder(symbol, isBuy, lots, slPrice, tpPrice, ticket);
+   
+   if(!ok)
+   {
+      Print("Order placement failed after all retries");
+      return false;
+   }
+
+   LastOrderTime = TimeCurrent();
+   
+   PrintFormat("Order placed: ticket=%I64u symbol=%s lot=%.2f SL=%.5f TP=%.5f conf=%d", 
+               ticket, symbol, lots, slPrice, tpPrice, confidence);
+
+   return true;
+}
+
+//==================== EVENT HANDLERS =================================
+
+int OnInit()
+{
+   EA_Symbol = GetSymbol();
+   
+   PrintFormat("CrashBoom v5.01 initialized");
+   PrintFormat("Symbol: %s", EA_Symbol);
+   PrintFormat("Confidence Threshold: %d%%", ConfidenceThreshold);
+   PrintFormat("Stop Loss Multiplier: %.2f (Max: %.2f)", StopLossMultiplier, MaxMultiplier);
+   PrintFormat("Dynamic Lots: %s", UseDynamicLotSizing ? "Enabled" : "Disabled");
+   
+   return INIT_SUCCEEDED;
+}
+
+void OnDeinit(const int reason)
+{
+   PrintFormat("CrashBoom v5.01 deinitialized. Reason: %d", reason);
+}
+
+void OnTick()
+{
+   string symbol = EA_Symbol;
+   
+   // Check if trading is paused
+   if(TradingPaused)
+   {
+      if(TimeCurrent() >= TradingPausedUntil)
+      {
+         TradingPaused = false;
+         RecoveryAttempts = 0;
+         Print("Trading pause ended. Resuming normal operations.");
+      }
+      else
+      {
+         return; // Stay paused
+      }
+   }
+
+   // Crash detection and recovery
+   if(DetectCrash(symbol))
+   {
+      RecoveryAttempts++;
+      PrintFormat("Recovery attempt %d/%d", RecoveryAttempts, RecoveryMaxAttempts);
+      
+      // Close all positions for this EA
+      for(int i = PositionsTotal() - 1; i >= 0; i--)
+      {
+         ulong ticket = PositionGetTicket(i);
+         if(!PositionSelectByTicket(ticket)) continue;
+
+         string posSym = PositionGetString(POSITION_SYMBOL);
+         long posMagic = PositionGetInteger(POSITION_MAGIC);
+         
+         if(posSym == symbol && posMagic == MagicNumber)
+         {
+            if(trade.PositionClose(ticket))
+            {
+               PrintFormat("Closed position ticket=%I64u due to crash recovery", ticket);
+            }
+            else
+            {
+               PrintFormat("Failed to close ticket=%I64u error=%d", 
+                          ticket, trade.ResultRetcode());
+            }
+         }
+      }
+
+      if(RecoveryAttempts >= RecoveryMaxAttempts)
+      {
+         TradingPaused = true;
+         TradingPausedUntil = TimeCurrent() + (RecoveryPauseMinutes * 60);
+         PrintFormat("Max recovery attempts reached. Pausing trading for %d minutes.", 
+                     RecoveryPauseMinutes);
+      }
+      return;
+   }
+
+   // Manage trailing stops
+   ManageTrailingStops(symbol);
+
+   // Attempt to place new orders (with cooldown built-in)
+   PlaceOrderPipeline(symbol);
+}
+
+//+------------------------------------------------------------------+
