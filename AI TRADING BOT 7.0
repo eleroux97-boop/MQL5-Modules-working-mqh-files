@@ -1,0 +1,569 @@
+//+------------------------------------------------------------------+
+//|                    CrashBoom_v7_StableRecovery.mq5               |
+//|      Crash 500 Cooldown Strategy with Stability Filter          |
+//+------------------------------------------------------------------+
+#property copyright "Crash 500 Stable Recovery EA"
+#property version   "7.00"
+#property strict
+
+#include <Trade\Trade.mqh>
+CTrade trade;
+
+//+------------------------------------------------------------------+
+//| INPUT PARAMETERS                                                 |
+//+------------------------------------------------------------------+
+input group "=== GROUP TRADING SETTINGS ==="
+input double InpGroupLotSize        = 0.50;  // Lot size per trade
+input int    InpTradesPerGroup      = 3;     // Trades per group
+input int    InpMaxBarsPerHour      = 3;     // Max bars per hour
+input int    InpMinBarGap           = 8;     // Min bars between entries
+input int    InpMagicNumber         = 50030; // Magic number
+
+input group "=== ATR COOLDOWN FILTER ==="
+input bool   InpUseATRFilter        = true;  // Enable ATR filter
+input int    InpATRPeriod           = 20;    // ATR Period
+input double InpATRMinPoints        = 300.0; // Min ATR points
+input double InpATRMaxPoints        = 600.0; // Max ATR points
+input bool   InpShowATROnChart      = true;  // Show ATR display
+
+input group "=== STABILITY FILTER ==="
+input bool   InpUseStabilityFilter  = true;  // Enable stability filter
+input int    InpStabilityLookback   = 10;    // Lookback bars
+input double InpMaxChopLevel        = 50.0;  // Max chop level
+input double InpMinDirectionStrength = 50.0; // Min direction strength
+
+input group "=== TREND FILTER ==="
+input bool   InpUseTrendFilter      = true;  // Enable trend filter
+input int    InpFastEMAPeriod       = 20;    // Fast EMA
+input int    InpSlowEMAPeriod       = 50;    // Slow EMA
+input bool   InpRequireBothEMA      = false; // Require both EMA conditions
+
+input group "=== PROFIT SETTINGS ==="
+input double InpProfitTargetUSD     = 1.10;  // Profit target USD
+input double InpStopLossMultiplier  = 1.5;   // SL multiplier
+
+input group "=== TRAILING STOP ==="
+input bool   InpUseTrailingStop     = true;  // Enable trailing stop
+input double InpTrailActivationATR  = 0.5;   // Trail activation
+
+input group "=== TIME FILTER ==="
+input bool   InpUseTimeFilter       = true;  // Enable time filter
+input int    InpTradingStartHour    = 3;     // Start hour
+input int    InpTradingEndHour      = 20;    // End hour
+
+input group "=== DIAGNOSTICS ==="
+input bool   InpShowDetailedLogs    = true;  // Show detailed logs
+
+//+------------------------------------------------------------------+
+//| GLOBAL VARIABLES                                                 |
+//+------------------------------------------------------------------+
+int CurrentHour = -1;
+int BarsTraded_ThisHour = 0;
+datetime LastBarTime = 0;
+datetime LastTradeBarTime = 0;
+datetime LastTradeTime = 0;
+
+int ATRHandle = INVALID_HANDLE;
+int FastEMAHandle = INVALID_HANDLE;
+int SlowEMAHandle = INVALID_HANDLE;
+
+int BarsChecked_ThisHour = 0;
+int ATRBlocked_ThisHour = 0;
+int TrendBlocked_ThisHour = 0;
+int GapBlocked_ThisHour = 0;
+int StabilityBlocked_ThisHour = 0;
+
+double LastATRValue = 0;
+double LastChopLevel = 0;
+double LastDirectionStrength = 0;
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   trade.SetExpertMagicNumber(InpMagicNumber);
+   trade.SetDeviationInPoints(5);
+   
+   MqlDateTime timeStruct;
+   TimeToStruct(TimeCurrent(), timeStruct);
+   CurrentHour = timeStruct.hour;
+   LastBarTime = iTime(_Symbol, PERIOD_M1, 0);
+   
+   if(InpUseATRFilter)
+   {
+      ATRHandle = iATR(_Symbol, PERIOD_M1, InpATRPeriod);
+      if(ATRHandle == INVALID_HANDLE)
+      {
+         Print("ERROR: Failed to create ATR indicator");
+         return(INIT_FAILED);
+      }
+   }
+   
+   if(InpUseTrendFilter)
+   {
+      FastEMAHandle = iMA(_Symbol, PERIOD_M1, InpFastEMAPeriod, 0, MODE_EMA, PRICE_CLOSE);
+      SlowEMAHandle = iMA(_Symbol, PERIOD_M1, InpSlowEMAPeriod, 0, MODE_EMA, PRICE_CLOSE);
+      
+      if(FastEMAHandle == INVALID_HANDLE || SlowEMAHandle == INVALID_HANDLE)
+      {
+         Print("ERROR: Failed to create EMA indicators");
+         return(INIT_FAILED);
+      }
+   }
+   
+   Print("========================================");
+   Print("Crash 500 Stable Recovery EA v7.00");
+   Print("ATR Range: ", InpATRMinPoints, "-", InpATRMaxPoints);
+   Print("Stability Filter: ", InpUseStabilityFilter ? "ON" : "OFF");
+   Print("========================================");
+   
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   if(ATRHandle != INVALID_HANDLE) IndicatorRelease(ATRHandle);
+   if(FastEMAHandle != INVALID_HANDLE) IndicatorRelease(FastEMAHandle);
+   if(SlowEMAHandle != INVALID_HANDLE) IndicatorRelease(SlowEMAHandle);
+   
+   ObjectDelete(0, "ATRLabel");
+   ObjectDelete(0, "StabilityLabel");
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   if(InpShowATROnChart) UpdateATRDisplay();
+   if(InpUseStabilityFilter) UpdateStabilityDisplay();
+   if(InpUseTrailingStop) ManageTrailingStop();
+   
+   datetime currentBarTime = iTime(_Symbol, PERIOD_M1, 0);
+   if(currentBarTime == LastBarTime) return;
+   
+   LastBarTime = currentBarTime;
+   
+   MqlDateTime timeStruct;
+   TimeToStruct(TimeCurrent(), timeStruct);
+   int newHour = timeStruct.hour;
+   
+   if(newHour != CurrentHour)
+   {
+      Print("=== HOUR ", CurrentHour, " SUMMARY ===");
+      Print("Bars Checked: ", BarsChecked_ThisHour);
+      Print("Bars Traded: ", BarsTraded_ThisHour);
+      Print("Blocked by ATR: ", ATRBlocked_ThisHour);
+      Print("Blocked by Stability: ", StabilityBlocked_ThisHour);
+      Print("Blocked by Trend: ", TrendBlocked_ThisHour);
+      
+      CurrentHour = newHour;
+      BarsTraded_ThisHour = 0;
+      BarsChecked_ThisHour = 0;
+      ATRBlocked_ThisHour = 0;
+      TrendBlocked_ThisHour = 0;
+      GapBlocked_ThisHour = 0;
+      StabilityBlocked_ThisHour = 0;
+   }
+   
+   BarsChecked_ThisHour++;
+   
+   if(BarsTraded_ThisHour >= InpMaxBarsPerHour) return;
+   
+   if(LastTradeBarTime > 0)
+   {
+      int barsSinceLastTrade = iBarShift(_Symbol, PERIOD_M1, LastTradeBarTime);
+      if(barsSinceLastTrade < InpMinBarGap)
+      {
+         GapBlocked_ThisHour++;
+         return;
+      }
+   }
+   
+   if(InpUseTimeFilter && !IsWithinTradingHours()) return;
+   
+   string blockReason = "";
+   if(!CheckAllConditions(blockReason))
+   {
+      if(InpShowDetailedLogs)
+         Print("Blocked: ", blockReason);
+      return;
+   }
+   
+   Print("=== OPENING TRADE GROUP ===");
+   if(OpenTradeGroup())
+   {
+      BarsTraded_ThisHour++;
+      LastTradeBarTime = currentBarTime;
+      LastTradeTime = TimeCurrent();
+      Print("SUCCESS: ", BarsTraded_ThisHour, "/", InpMaxBarsPerHour, " bars traded");
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Check All Trading Conditions                                     |
+//+------------------------------------------------------------------+
+bool CheckAllConditions(string &reason)
+{
+   if(InpUseATRFilter)
+   {
+      double atrPoints = 0;
+      if(!CheckATRCooldown(atrPoints))
+      {
+         ATRBlocked_ThisHour++;
+         reason = StringFormat("ATR: %.2f (need %.0f-%.0f)", atrPoints, InpATRMinPoints, InpATRMaxPoints);
+         return false;
+      }
+   }
+   
+   if(InpUseStabilityFilter)
+   {
+      string details = "";
+      if(!CheckMarketStability(details))
+      {
+         StabilityBlocked_ThisHour++;
+         reason = "Stability: " + details;
+         return false;
+      }
+   }
+   
+   if(InpUseTrendFilter)
+   {
+      string details = "";
+      if(!CheckUpwardTrend(details))
+      {
+         TrendBlocked_ThisHour++;
+         reason = "Trend: " + details;
+         return false;
+      }
+   }
+   
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Check ATR Cooldown                                               |
+//+------------------------------------------------------------------+
+bool CheckATRCooldown(double &atrPoints)
+{
+   if(ATRHandle == INVALID_HANDLE) return false;
+   
+   double atrBuffer[1];
+   if(CopyBuffer(ATRHandle, 0, 0, 1, atrBuffer) <= 0) return false;
+   
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   if(point <= 0.0) return false;
+   
+   atrPoints = atrBuffer[0] / point;
+   LastATRValue = atrPoints;
+   
+   if(atrPoints < InpATRMinPoints || atrPoints > InpATRMaxPoints)
+      return false;
+   
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Check Market Stability                                           |
+//+------------------------------------------------------------------+
+bool CheckMarketStability(string &details)
+{
+   MqlRates rates[];
+   ArraySetAsSeries(rates, true);
+   
+   int needed = InpStabilityLookback + 1;
+   if(CopyRates(_Symbol, PERIOD_M1, 0, needed, rates) < needed)
+   {
+      details = "Cannot get rates";
+      return false;
+   }
+   
+   int directionChanges = 0;
+   int upMoves = 0;
+   int downMoves = 0;
+   
+   for(int i = 0; i < InpStabilityLookback - 1; i++)
+   {
+      bool currentUp = rates[i].close > rates[i + 1].close;
+      bool nextUp = rates[i + 1].close > rates[i + 2].close;
+      
+      if(currentUp) upMoves++;
+      else downMoves++;
+      
+      if(currentUp != nextUp) directionChanges++;
+   }
+   
+   double chopPercentage = (double)directionChanges / (InpStabilityLookback - 2) * 100.0;
+   double directionStrength = MathAbs((double)(upMoves - downMoves)) / InpStabilityLookback * 100.0;
+   
+   LastChopLevel = chopPercentage;
+   LastDirectionStrength = directionStrength;
+   
+   details = StringFormat("Chop %.1f%% Dir %.1f%%", chopPercentage, directionStrength);
+   
+   if(chopPercentage > InpMaxChopLevel) return false;
+   if(directionStrength < InpMinDirectionStrength) return false;
+   
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Check Upward Trend                                               |
+//+------------------------------------------------------------------+
+bool CheckUpwardTrend(string &details)
+{
+   if(FastEMAHandle == INVALID_HANDLE || SlowEMAHandle == INVALID_HANDLE)
+      return false;
+   
+   double fastEMA[1], slowEMA[1];
+   
+   if(CopyBuffer(FastEMAHandle, 0, 0, 1, fastEMA) <= 0) return false;
+   if(CopyBuffer(SlowEMAHandle, 0, 0, 1, slowEMA) <= 0) return false;
+   
+   double currentPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   
+   bool priceAboveSlow = currentPrice > slowEMA[0];
+   bool fastAboveSlow = fastEMA[0] > slowEMA[0];
+   
+   details = StringFormat("Price:%s EMA:%s", priceAboveSlow?"OK":"NO", fastAboveSlow?"OK":"NO");
+   
+   if(InpRequireBothEMA)
+      return (priceAboveSlow && fastAboveSlow);
+   else
+      return (priceAboveSlow || fastAboveSlow);
+}
+
+//+------------------------------------------------------------------+
+//| Open Trade Group                                                 |
+//+------------------------------------------------------------------+
+bool OpenTradeGroup()
+{
+   long minStopLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   if(minStopLevel == 0) minStopLevel = 10;
+   
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   double minStopDistance = minStopLevel * point;
+   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   
+   double stopLoss = NormalizeDouble(ask - (InpStopLossMultiplier * minStopDistance), digits);
+   
+   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   double takeProfit;
+   
+   if(tickValue > 0 && tickSize > 0)
+   {
+      double pointsNeeded = (InpProfitTargetUSD / (tickValue * InpGroupLotSize)) * tickSize;
+      takeProfit = NormalizeDouble(ask + pointsNeeded, digits);
+   }
+   else
+   {
+      takeProfit = NormalizeDouble(ask + (2.0 * minStopDistance), digits);
+   }
+   
+   double lotSize = ValidateLotSize(InpGroupLotSize);
+   
+   int successCount = 0;
+   
+   for(int i = 0; i < InpTradesPerGroup; i++)
+   {
+      string comment = StringFormat("Cooldown_H%d_T%d", BarsTraded_ThisHour + 1, i + 1);
+      
+      if(trade.Buy(lotSize, _Symbol, 0.0, stopLoss, takeProfit, comment))
+      {
+         successCount++;
+         Print("Trade ", (i+1), " opened: ", trade.ResultOrder());
+      }
+      else
+      {
+         Print("Trade ", (i+1), " FAILED: ", GetLastError());
+      }
+      
+      Sleep(200);
+   }
+   
+   return (successCount > 0);
+}
+
+//+------------------------------------------------------------------+
+//| Validate Lot Size                                                |
+//+------------------------------------------------------------------+
+double ValidateLotSize(double requestedLot)
+{
+   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   
+   if(lotStep <= 0.0) lotStep = 0.01;
+   if(minLot <= 0.0) minLot = 0.01;
+   
+   double lot = requestedLot;
+   lot = MathMax(lot, minLot);
+   lot = MathMin(lot, maxLot);
+   lot = MathFloor(lot / lotStep) * lotStep;
+   
+   return NormalizeDouble(lot, 2);
+}
+
+//+------------------------------------------------------------------+
+//| Time Filter                                                      |
+//+------------------------------------------------------------------+
+bool IsWithinTradingHours()
+{
+   MqlDateTime timeStruct;
+   TimeToStruct(TimeCurrent(), timeStruct);
+   int currentHour = timeStruct.hour;
+   return (currentHour >= InpTradingStartHour && currentHour < InpTradingEndHour);
+}
+
+//+------------------------------------------------------------------+
+//| Trailing Stop Management                                         |
+//+------------------------------------------------------------------+
+void ManageTrailingStop()
+{
+   long minStopLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   if(minStopLevel == 0) minStopLevel = 10;
+   
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   double minStopDistance = minStopLevel * point;
+   
+   double atrBuffer[1];
+   double atrValue = 0;
+   
+   if(ATRHandle != INVALID_HANDLE && CopyBuffer(ATRHandle, 0, 0, 1, atrBuffer) > 0)
+      atrValue = atrBuffer[0];
+   
+   double trailActivation = atrValue * InpTrailActivationATR;
+   double currentBid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      
+      if(!PositionSelectByTicket(ticket)) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != InpMagicNumber) continue;
+      
+      ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+      if(posType != POSITION_TYPE_BUY) continue;
+      
+      double posOpenPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+      double posCurrentSL = PositionGetDouble(POSITION_SL);
+      double posCurrentTP = PositionGetDouble(POSITION_TP);
+      
+      double profitDistance = currentBid - posOpenPrice;
+      
+      if(profitDistance >= trailActivation && trailActivation > 0)
+      {
+         double newSL = NormalizeDouble(currentBid - minStopDistance, digits);
+         
+         if(posCurrentSL == 0.0 || newSL > posCurrentSL)
+         {
+            if(currentBid - newSL >= minStopDistance)
+            {
+               trade.PositionModify(ticket, newSL, posCurrentTP);
+            }
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Update ATR Display                                               |
+//+------------------------------------------------------------------+
+void UpdateATRDisplay()
+{
+   if(ATRHandle == INVALID_HANDLE) return;
+   
+   double atrBuffer[1];
+   if(CopyBuffer(ATRHandle, 0, 0, 1, atrBuffer) <= 0) return;
+   
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   if(point <= 0.0) return;
+   
+   double atrPoints = atrBuffer[0] / point;
+   LastATRValue = atrPoints;
+   
+   color statusColor;
+   string status;
+   
+   if(atrPoints < InpATRMinPoints)
+   {
+      statusColor = clrOrange;
+      status = "LOW";
+   }
+   else if(atrPoints > InpATRMaxPoints)
+   {
+      statusColor = clrRed;
+      status = "HIGH";
+   }
+   else
+   {
+      statusColor = clrLime;
+      status = "OK";
+   }
+   
+   string labelText = StringFormat("ATR: %.0f | %s", atrPoints, status);
+   
+   if(ObjectFind(0, "ATRLabel") < 0)
+   {
+      ObjectCreate(0, "ATRLabel", OBJ_LABEL, 0, 0, 0);
+      ObjectSetInteger(0, "ATRLabel", OBJPROP_CORNER, CORNER_LEFT_UPPER);
+      ObjectSetInteger(0, "ATRLabel", OBJPROP_XDISTANCE, 10);
+      ObjectSetInteger(0, "ATRLabel", OBJPROP_YDISTANCE, 30);
+      ObjectSetInteger(0, "ATRLabel", OBJPROP_FONTSIZE, 10);
+      ObjectSetString(0, "ATRLabel", OBJPROP_FONT, "Arial Bold");
+   }
+   
+   ObjectSetString(0, "ATRLabel", OBJPROP_TEXT, labelText);
+   ObjectSetInteger(0, "ATRLabel", OBJPROP_COLOR, statusColor);
+}
+
+//+------------------------------------------------------------------+
+//| Update Stability Display                                         |
+//+------------------------------------------------------------------+
+void UpdateStabilityDisplay()
+{
+   color statusColor;
+   string status;
+   
+   if(LastChopLevel > InpMaxChopLevel)
+   {
+      statusColor = clrRed;
+      status = "CHOPPY";
+   }
+   else if(LastDirectionStrength < InpMinDirectionStrength)
+   {
+      statusColor = clrOrange;
+      status = "WEAK";
+   }
+   else
+   {
+      statusColor = clrLime;
+      status = "STABLE";
+   }
+   
+   string labelText = StringFormat("Market: %s | Chop: %.0f%%", status, LastChopLevel);
+   
+   if(ObjectFind(0, "StabilityLabel") < 0)
+   {
+      ObjectCreate(0, "StabilityLabel", OBJ_LABEL, 0, 0, 0);
+      ObjectSetInteger(0, "StabilityLabel", OBJPROP_CORNER, CORNER_LEFT_UPPER);
+      ObjectSetInteger(0, "StabilityLabel", OBJPROP_XDISTANCE, 10);
+      ObjectSetInteger(0, "StabilityLabel", OBJPROP_YDISTANCE, 50);
+      ObjectSetInteger(0, "StabilityLabel", OBJPROP_FONTSIZE, 9);
+      ObjectSetString(0, "StabilityLabel", OBJPROP_FONT, "Arial");
+   }
+   
+   ObjectSetString(0, "StabilityLabel", OBJPROP_TEXT, labelText);
+   ObjectSetInteger(0, "StabilityLabel", OBJPROP_COLOR, statusColor);
+}
+//+------------------------------------------------------------------+
