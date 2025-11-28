@@ -1,0 +1,216 @@
+//+------------------------------------------------------------------+
+//| Expert Advisor: CrashBoom500 v4.1 – Enhanced Decision Engine    |
+//| Description: Adds trend filter, ATR volatility control,         |
+//| confidence scoring, adaptive SL, intelligent exits, and        |
+//| improved trailing profit logic.                                |
+//+------------------------------------------------------------------+
+#property strict
+
+#include <Trade/Trade.mqh>
+CTrade Trade;
+
+//-------------------- INPUT SETTINGS ------------------------------//
+input double BaseLotSize          = 0.20;
+input int    MaxTrades            = 10;
+input double MaxDrawdownPercent   = 25.0;
+input double CrashDropPercent     = 1.50;
+input int    CrashBars            = 3;
+input double RecoveryMultiplier   = 2.0;
+
+input int EMA_FastPeriod          = 50;
+input int EMA_SlowPeriod          = 200;
+
+input int ATR_Period              = 14;
+input double ATR_MinVolatility    = 0.00080;
+
+input double ConfidenceThreshold  = 75.0;
+input bool UseAdaptiveSL          = true;
+input double ATR_SL_Multiplier    = 4.0;
+
+input bool UseTrailingStop        = true;
+input double ATR_TrailMultiplier  = 2.0;
+
+double account_start;
+bool recovery_mode = false;
+double crash_price = 0;
+
+//------------------------------------------------------------------//
+// INITIALIZATION
+//------------------------------------------------------------------//
+int OnInit()
+{
+   account_start = AccountInfoDouble(ACCOUNT_EQUITY);
+   Print("CrashBoom500 v4.1 successfully loaded.");
+   return(INIT_SUCCEEDED);
+}
+
+//------------------------------------------------------------------//
+// DRAWDOWN PROTECTION
+//------------------------------------------------------------------//
+bool CheckDrawdown()
+{
+   double eq = AccountInfoDouble(ACCOUNT_EQUITY);
+   double dd = (account_start - eq) / account_start * 100;
+
+   if(dd >= MaxDrawdownPercent)
+   {
+      Print("STOP: Max drawdown reached!");
+      return(true);
+   }
+   return(false);
+}
+
+//------------------------------------------------------------------//
+// EMA TREND CONFIRMATION
+//------------------------------------------------------------------//
+bool TrendIsBullish()
+{
+   double fast = iMA(Symbol(), PERIOD_M1, EMA_FastPeriod, 0, MODE_EMA, PRICE_CLOSE, 0);
+   double slow = iMA(Symbol(), PERIOD_M1, EMA_SlowPeriod, 0, MODE_EMA, PRICE_CLOSE, 0);
+
+   return (fast > slow);
+}
+
+//------------------------------------------------------------------//
+// ATR VOLATILITY GATE
+//------------------------------------------------------------------//
+bool IsMarketVolatile()
+{
+   double atr = iATR(Symbol(), PERIOD_M1, ATR_Period, 0);
+   return atr >= ATR_MinVolatility;
+}
+
+//------------------------------------------------------------------//
+// CRASH DETECTION
+//------------------------------------------------------------------//
+bool DetectCrash()
+{
+   double p1 = iClose(Symbol(), PERIOD_M1, 1);
+   double p2 = iClose(Symbol(), PERIOD_M1, 2);
+   double p3 = iClose(Symbol(), PERIOD_M1, 3);
+
+   double drop1 = (p2 - p1) / p2 * 100;
+   double drop2 = (p3 - p2) / p3 * 100;
+
+   if(drop1 >= CrashDropPercent && drop2 >= CrashDropPercent)
+   {
+      crash_price = p1;
+      return(true);
+   }
+   return(false);
+}
+
+//------------------------------------------------------------------//
+// CONFIDENCE ENGINE
+//------------------------------------------------------------------//
+double GetConfidenceScore()
+{
+   double score = 0;
+
+   if(TrendIsBullish()) score += 40;
+   if(IsMarketVolatile()) score += 20;
+
+   double current = SymbolInfoDouble(Symbol(), SYMBOL_BID);
+   if(current < crash_price) score += 20;   // still cheap
+
+   if(!recovery_mode) score += 20;          // fresh cycle
+
+   return(score);
+}
+
+//------------------------------------------------------------------//
+// LOT SIZE ENGINE
+//------------------------------------------------------------------//
+double GetLot()
+{
+   if(!recovery_mode) return(BaseLotSize);
+   return(BaseLotSize * RecoveryMultiplier);
+}
+
+//------------------------------------------------------------------//
+// ADAPTIVE STOP LOSS
+//------------------------------------------------------------------//
+double GetAdaptiveSL()
+{
+   if(!UseAdaptiveSL) return(0);
+
+   double atr = iATR(Symbol(), PERIOD_M1, ATR_Period, 0);
+   return(SymbolInfoDouble(Symbol(), SYMBOL_BID) - atr * ATR_SL_Multiplier);
+}
+
+//------------------------------------------------------------------//
+// TRADE EXECUTION
+//------------------------------------------------------------------//
+void PlaceBuy()
+{
+   double lot = GetLot();
+   double sl = GetAdaptiveSL();
+
+   if(PositionSelect(Symbol()) == false)
+   {
+      if(Trade.Buy(lot, Symbol(), 0, sl, 0))
+      {
+         Print("BUY EXECUTED | Lot: ", lot, " SL: ", sl);
+         recovery_mode = true;
+      }
+   }
+}
+
+//------------------------------------------------------------------//
+// INTELLIGENT EXIT ENGINE
+//------------------------------------------------------------------//
+void ManageExit()
+{
+   if(!PositionSelect(Symbol())) return;
+
+   double open = PositionGetDouble(POSITION_PRICE_OPEN);
+   double current = SymbolInfoDouble(Symbol(), SYMBOL_BID);
+
+   // Exit if trend flips bearish
+   if(!TrendIsBullish() && current < open)
+   {
+      Print("EXIT: Trend reversal detected");
+      Trade.PositionClose(Symbol());
+      recovery_mode = false;
+   }
+}
+
+//------------------------------------------------------------------//
+// TRAILING PROFIT ENGINE
+//------------------------------------------------------------------//
+void TrailProfits()
+{
+   if(!UseTrailingStop) return;
+   if(!PositionSelect(Symbol())) return;
+
+   double atr = iATR(Symbol(), PERIOD_M1, ATR_Period, 0);
+   double newSL = SymbolInfoDouble(Symbol(), SYMBOL_BID) - atr * ATR_TrailMultiplier;
+
+   Trade.PositionModify(Symbol(), newSL, 0);
+}
+
+//------------------------------------------------------------------//
+// ONTICK MAIN LOOP
+//------------------------------------------------------------------//
+void OnTick()
+{
+   if(CheckDrawdown()) return;
+
+   bool crash = DetectCrash();
+
+   if(crash)
+   {
+      double conf = GetConfidenceScore();
+      Print("Signal Confidence: ", conf, "%");
+
+      if(conf >= ConfidenceThreshold && TrendIsBullish() && IsMarketVolatile())
+         PlaceBuy();
+      else
+         Print("Entry Rejected: Low confidence");
+   }
+
+   ManageExit();
+   TrailProfits();
+}
+//+------------------------------------------------------------------+
+
