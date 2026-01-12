@@ -1,0 +1,130 @@
+# ===============================
+# Hybrid EMA + ADX Crypto Bot
+# Binance Spot | Single File
+# ===============================
+
+import ccxt
+import pandas as pd
+import time
+import numpy as np
+
+# ===============================
+# CONFIG
+# ===============================
+API_KEY = 'YOUR_API_KEY'
+API_SECRET = 'YOUR_API_SECRET'
+
+SYMBOL = 'BTC/USDT'
+TIMEFRAME = '5m'
+BASE_ORDER_SIZE = 0.001
+DCA_MULTIPLIER = 1.5
+MAX_DCA_ORDERS = 3
+
+TAKE_PROFIT_PCT = 0.8
+STOP_LOSS_PCT = 1.2
+
+EMA_FAST = 20
+EMA_SLOW = 50
+ADX_PERIOD = 14
+ADX_THRESHOLD = 25
+
+# ===============================
+# EXCHANGE SETUP
+# ===============================
+exchange = ccxt.binance({
+    'apiKey': API_KEY,
+    'secret': API_SECRET,
+    'enableRateLimit': True,
+    'options': {'defaultType': 'spot'}
+})
+
+# ===============================
+# INDICATORS
+# ===============================
+def EMA(series, period):
+    return series.ewm(span=period, adjust=False).mean()
+
+def ADX(df, period=14):
+    df['TR'] = np.maximum(df['high'] - df['low'],
+                           np.maximum(abs(df['high'] - df['close'].shift()),
+                                      abs(df['low'] - df['close'].shift())))
+    df['+DM'] = np.where((df['high'] - df['high'].shift()) > (df['low'].shift() - df['low']),
+                         np.maximum(df['high'] - df['high'].shift(), 0), 0)
+    df['-DM'] = np.where((df['low'].shift() - df['low']) > (df['high'] - df['high'].shift()),
+                         np.maximum(df['low'].shift() - df['low'], 0), 0)
+
+    tr_smooth = df['TR'].rolling(period).mean()
+    plus_dm_smooth = df['+DM'].rolling(period).mean()
+    minus_dm_smooth = df['-DM'].rolling(period).mean()
+
+    plus_di = 100 * (plus_dm_smooth / tr_smooth)
+    minus_di = 100 * (minus_dm_smooth / tr_smooth)
+
+    dx = (abs(plus_di - minus_di) / (plus_di + minus_di)) * 100
+    adx = dx.rolling(period).mean()
+
+    return adx
+
+# ===============================
+# DATA FETCH
+# ===============================
+def fetch_data():
+    ohlcv = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=100)
+    df = pd.DataFrame(ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
+    df['ema_fast'] = EMA(df['close'], EMA_FAST)
+    df['ema_slow'] = EMA(df['close'], EMA_SLOW)
+    df['adx'] = ADX(df, ADX_PERIOD)
+    return df
+
+# ===============================
+# ORDER MANAGEMENT
+# ===============================
+def place_market_buy(amount):
+    order = exchange.create_market_buy_order(SYMBOL, amount)
+    print("BUY:", order)
+    return order['average']
+
+def place_market_sell(amount):
+    order = exchange.create_market_sell_order(SYMBOL, amount)
+    print("SELL:", order)
+
+# ===============================
+# BOT LOGIC
+# ===============================
+position_size = 0
+entry_price = 0
+dca_count = 0
+
+while True:
+    try:
+        df = fetch_data()
+        last = df.iloc[-1]
+
+        trend_up = last['ema_fast'] > last['ema_slow']
+        strong_trend = last['adx'] > ADX_THRESHOLD
+        price = last['close']
+
+        if position_size == 0 and trend_up and strong_trend:
+            entry_price = place_market_buy(BASE_ORDER_SIZE)
+            position_size = BASE_ORDER_SIZE
+            dca_count = 0
+
+        if position_size > 0:
+            pnl_pct = ((price - entry_price) / entry_price) * 100
+
+            if pnl_pct <= -(STOP_LOSS_PCT / (dca_count + 1)) and dca_count < MAX_DCA_ORDERS:
+                dca_size = BASE_ORDER_SIZE * (DCA_MULTIPLIER ** dca_count)
+                new_price = place_market_buy(dca_size)
+                entry_price = ((entry_price * position_size) + (new_price * dca_size)) / (position_size + dca_size)
+                position_size += dca_size
+                dca_count += 1
+
+            elif pnl_pct >= TAKE_PROFIT_PCT:
+                place_market_sell(position_size)
+                position_size = 0
+
+        time.sleep(30)
+
+    except Exception as e:
+        print("Error:", e)
+        time.sleep(60)
